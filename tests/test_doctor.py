@@ -70,13 +70,14 @@ def test_dev_build_has_no_published_mpy_cross(tmp_path, monkeypatch):
     assert not any("s3.amazonaws.com" in l for l in lines)  # never a URL that 404s
 
 
-def test_uncached_prints_the_fetch_url(tmp_path, monkeypatch):
+def test_offline_prints_the_fetch_url_and_does_not_fetch(tmp_path, monkeypatch):
     monkeypatch.setenv("TURBO_CACHE", str(tmp_path / "cache"))
     monkeypatch.setattr(t, "platform_key", lambda *a: "linux-amd64")
-    lines, ready = t.doctor_lines(facts(), src=str(tmp_path / "none"))
+    monkeypatch.setattr(t, "fetch_mpy_cross", lambda *a, **k: pytest.fail("fetched"))
+    lines, ready = t.doctor_lines(facts(), offline=True, src=str(tmp_path / "none"))
     assert not ready
     assert "toolchain   not cached  linux-amd64  10.3.0" in lines
-    assert lines[-2].strip() == t.mpy_cross_url("10.3.0", "linux-amd64")
+    assert any(l.strip() == t.mpy_cross_url("10.3.0", "linux-amd64") for l in lines)
     assert lines[-1].startswith("not ready   ")
 
 
