@@ -5,7 +5,7 @@ bench the candidates on a board, install the winner, keep a manifest.
     turbo_cli.py doctor [--port TTY] [--mount DIR] [--arch A] [--mpy-cross PATH]
     turbo_cli.py init   [--arch A] [--example]
     turbo_cli.py build  SRC_DIR [--out lib/turbo] [--mpy-cross PATH] [--arch a,b]
-    turbo_cli.py bench  MODULE --port TTY --mount CIRCUITPY [--out lib/turbo] [--trials N]
+    turbo_cli.py bench  MODULE [--port TTY] [--mount DIR] [--trials N]
     turbo_cli.py check  SRC_DIR [--out lib/turbo]
     turbo_cli.py analyze SRC [--arch A | --board B] [--json]
     turbo_cli.py verify BASELINE.py CANDIDATE.py --fn NAME [--inputs FILE.py]
@@ -417,27 +417,39 @@ def cmd_build(a):
     return 1 if failed else 0
 
 
-def board_exec(pyb, code, timeout=600):
-    return pyb.exec_(code, timeout=timeout).decode().strip()
+def board_exec(repl, code, timeout=600):
+    """Run one statement on the board and return its stdout. A traceback on the
+    board is an error here, not a result."""
+    out, err = repl.exec(code, timeout=timeout)
+    if err.strip():
+        raise RuntimeError(err.strip().splitlines()[-1])
+    return out.strip()
 
 
 def cmd_bench(a):
-    sys.path.insert(0, a.pyboard_tools)
-    import pyboard  # from a CircuitPython/MicroPython tree
+    import turbo_repl
 
     manifest = load_manifest(a.out)
     entry = manifest.get(a.module)
     if not entry:
         sys.exit("no manifest entry for %s; run build first" % a.module)
 
-    pyb = pyboard.Pyboard(a.port, 115200)
-    pyb.enter_raw_repl()
-    mpy = int(board_exec(pyb, "import sys; print(sys.implementation._mpy)"))
-    arch = {v: k for k, v in ARCH_ID.items()}.get(mpy >> 10)
-    print("board: mpy v%d.%d arch %s" % (mpy & 0xff, (mpy >> 8) & 3, arch))
-    if not arch:
+    f = board_facts(a)
+    if not f["port"]:
+        sys.exit("no serial port found\n"
+                 "   bench measures on the board, so it needs the REPL. Plug the board\n"
+                 "   in, or pass --port TTY.")
+    if not f["mount"]:
+        sys.exit("no CIRCUITPY drive\n"
+                 "   bench copies one candidate at a time to the board. Pass --mount DIR.")
+    if not f["arch"]:
         sys.exit("stock firmware, nothing to bench")
-    board_dir = os.path.join(a.mount, "lib", "turbo", arch)
+    arch = f["arch"]
+    print("board: mpy v%s arch %s on %s" % (f["abi"], arch, f["port"]))
+
+    repl = turbo_repl.RawREPL(f["port"])
+    repl.enter_raw()
+    board_dir = os.path.join(f["mount"], "lib", "turbo", arch)
     os.makedirs(board_dir, exist_ok=True)
     installed = os.path.join(board_dir, a.module + ".mpy")
 
@@ -447,37 +459,40 @@ def cmd_bench(a):
             variants[tier] = ("mpy", os.path.join(a.out, arch, "%s.%s.mpy" % (a.module, tier)))
 
     def clear_board_module():
-        for f in os.listdir(board_dir):
-            if f.startswith(a.module + "."):
-                os.remove(os.path.join(board_dir, f))
+        for fn in os.listdir(board_dir):
+            if fn.startswith(a.module + "."):
+                os.remove(os.path.join(board_dir, fn))
 
     # Snapshot the module's files under the arch dir so an interrupted bench can
     # put the board back exactly as it was.
-    before = {f: open(os.path.join(board_dir, f), "rb").read()
-              for f in os.listdir(board_dir) if f.startswith(a.module + ".")}
+    before = {fn: open(os.path.join(board_dir, fn), "rb").read()
+              for fn in os.listdir(board_dir) if fn.startswith(a.module + ".")}
     done = False
     results = {}
     try:
         for tier, (kind, src) in variants.items():
             # place exactly one candidate under the arch dir, as the name the shim imports
             clear_board_module()
-            shutil.copyfile(src, os.path.join(board_dir, a.module + (".py" if kind == "py" else ".mpy")))
-            os.sync()
+            shutil.copyfile(src, os.path.join(board_dir,
+                                              a.module + (".py" if kind == "py" else ".mpy")))
+            if hasattr(os, "sync"):
+                os.sync()
             time.sleep(2)
-            pyb.exit_raw_repl()
-            pyb.enter_raw_repl()  # soft reset clears the module cache
-            board_exec(pyb, "import gc, time, turbo, %s" % a.module)
+            repl.soft_reset()  # clears the import cache; the new file is what loads
+            board_exec(repl, "import gc, time, turbo, %s" % a.module)
             vals, times = set(), []
             for _ in range(a.trials):
-                board_exec(pyb, "gc.collect()")
-                out = board_exec(pyb, "t0=time.monotonic_ns(); v=%s._turbo_bench(); "
-                                      "print((time.monotonic_ns()-t0)//1000, v)" % a.module).split()
+                board_exec(repl, "gc.collect()")
+                out = board_exec(repl, "t0=time.monotonic_ns(); v=%s._turbo_bench(); "
+                                       "print((time.monotonic_ns()-t0)//1000, v)"
+                                 % a.module).split()
                 times.append(int(out[0]))
                 vals.add(out[1])
             times.sort()
             results[tier] = {"us_median": times[len(times) // 2], "us_min": times[0],
                              "value": sorted(vals)[0] if len(vals) == 1 else list(vals)}
-            print("%-9s median %9.1f ms  value %s" % (tier, times[len(times) // 2] / 1000, results[tier]["value"]))
+            print("%-9s median %9.1f ms  value %s"
+                  % (tier, times[len(times) // 2] / 1000, results[tier]["value"]))
 
         ref = results["bytecode"]["value"]
         base = results["bytecode"]["us_median"]
@@ -493,7 +508,8 @@ def cmd_bench(a):
         if best and gain >= a.min_gain:
             winner, why = best, None
         elif best:
-            winner, why = None, "bytecode wins: %s is %.2fx, below --min-gain %.2f" % (best, gain, a.min_gain)
+            winner, why = None, "bytecode wins: %s is %.2fx, below --min-gain %.2f" % (
+                best, gain, a.min_gain)
         else:
             winner, why = None, "bytecode wins: no compiled candidate matched the bytecode output"
         if why:
@@ -502,35 +518,34 @@ def cmd_bench(a):
         clear_board_module()
         local_installed = os.path.join(a.out, arch, a.module + ".mpy")
         if winner:
-            shutil.copyfile(os.path.join(a.out, arch, "%s.%s.mpy" % (a.module, winner)), installed)
+            shutil.copyfile(os.path.join(a.out, arch, "%s.%s.mpy" % (a.module, winner)),
+                            installed)
             shutil.copyfile(installed, local_installed)
         elif os.path.exists(local_installed):
             os.remove(local_installed)  # so pack does not ship a loser
-        os.sync()
+        if hasattr(os, "sync"):
+            os.sync()
         done = True
     finally:
         if not done:
             # interrupted or failed: restore the module's files on the board
             try:
                 clear_board_module()
-                for f, data in before.items():
-                    with open(os.path.join(board_dir, f), "wb") as fh:
+                for fn, data in before.items():
+                    with open(os.path.join(board_dir, fn), "wb") as fh:
                         fh.write(data)
-                os.sync()
+                if hasattr(os, "sync"):
+                    os.sync()
                 print("bench aborted; board files for %s restored" % a.module)
             except OSError as e:
                 print("bench aborted; could not restore board files:", e)
-        try:
-            pyb.exit_raw_repl()
-        except Exception:
-            pass
-        pyb.close()
+        repl.close()
 
     # reload before writing: another bench (other board, other arch) may have saved meanwhile
     manifest = load_manifest(a.out)
     entry = manifest.setdefault(a.module, entry)
     ae = entry.setdefault(arch, {})
-    ae.update({"installed": winner, "measured": True, "mpy_abi": "%d.%d" % (mpy & 0xff, (mpy >> 8) & 3),
+    ae.update({"installed": winner, "measured": True, "mpy_abi": f["abi"],
                "bench": results, "rejected": bad, "trials": a.trials, "min_gain": a.min_gain,
                "speedup_vs_bytecode": round(gain, 2) if winner else None,
                "bytecode_wins": why})
@@ -1684,15 +1699,16 @@ def main():
     b.add_argument("--offline", action="store_true", help="never fetch mpy-cross")
     b.add_argument("-v", "--verbose", action="store_true")
     b.set_defaults(run=cmd_build)
-    n = sub.add_parser("bench")
+    n = sub.add_parser("bench", help="time every candidate on the board, install the winner")
     n.add_argument("module")
-    n.add_argument("--port", required=True)
-    n.add_argument("--mount", required=True)
+    n.add_argument("--port", help="serial port; autodetected when absent")
+    n.add_argument("--mount", help="CIRCUITPY drive; autodetected when absent")
+    n.add_argument("--board")
+    n.add_argument("--arch")
     n.add_argument("--out", default="lib/turbo")
     n.add_argument("--trials", type=int, default=5)
     n.add_argument("--min-gain", type=float, default=1.05,
                    help="a compiled tier must beat the bytecode median by this factor (default 1.05)")
-    n.add_argument("--pyboard-tools", default=os.path.expanduser("~/cp-1030/tools"))
     n.set_defaults(run=cmd_bench)
     w = sub.add_parser("watch", help="rebuild and copy a module every time you save it")
     w.add_argument("src", nargs="?", default="src")

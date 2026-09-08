@@ -3,8 +3,6 @@
 import os
 import sys
 
-import pytest
-
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "cli"))
 import turbo_cli as t  # noqa: E402
 

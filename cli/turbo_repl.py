@@ -120,6 +120,18 @@ class RawREPL:
         self._read_until(b">", deadline, "raw prompt")
         return out.decode(errors="replace"), err.decode(errors="replace")
 
+    def soft_reset(self, timeout=10.0):
+        """Ctrl-D at the raw prompt: restart the VM so the next import re-reads the
+        drive instead of returning the cached module. The only place turbo resets a
+        board, and bench is the only caller. Byte sequence mirrors pyboard.py."""
+        if not self._raw:
+            self.enter_raw()
+        deadline = time.monotonic() + timeout
+        self._pending = b""
+        self.ser.write(b"\x04")
+        self._read_until(b"soft reboot\r\n", deadline, "soft reboot banner")
+        self._read_until(RAW_BANNER, deadline, "raw REPL banner after the soft reset")
+
     def exit_raw(self):
         self.ser.write(b"\r\x02")
         self._raw = False

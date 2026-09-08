@@ -154,3 +154,19 @@ def test_find_ports_uid_wins_over_name_order(monkeypatch):
 def test_find_ports_explicit_is_the_only_candidate(monkeypatch):
     _ports(monkeypatch, [("/dev/ttyACM0", 0x239A, "Metro", "AA")])
     assert r.find_ports(explicit="/dev/whatever") == ["/dev/whatever"]
+
+
+def test_soft_reset_waits_for_both_banners():
+    repl, fake = make(RAW + [(b"\x04", b"soft reboot\r\n" + r.RAW_BANNER)])
+    repl.enter_raw()
+    repl.soft_reset()
+    assert bytes(fake.written) == b"\r\x03\x03\r\x01\x04"
+    assert repl._raw
+
+
+def test_soft_reset_times_out_if_the_board_does_not_come_back():
+    repl, fake = make(RAW)
+    repl.enter_raw()
+    with pytest.raises(r.REPLError) as e:
+        repl.soft_reset(timeout=0.05)
+    assert "soft reboot banner" in str(e.value)
