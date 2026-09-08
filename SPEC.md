@@ -323,8 +323,17 @@ write `src/pixels.py` and `code.py` from `examples/mandelbrot/` only if
 Default arch: the connected board's arch from the probe; with no board, `--arch`
 is required (sentence in section 6). `--arch all` builds every entry in the 2.2
 table with a `-march`. Compiles both tiers per arch, installs viper if it
-compiled else native (existing rule), updates the manifest, copies to the
-mount's `lib/turbo/<arch>/` when a mount is present (skip with `--no-copy`).
+compiled else native (existing rule), updates the manifest, copies to the mount
+when one is present (skip with `--no-copy`).
+
+Amended 2026-09-08 after the farm pass. Copying only `lib/turbo/<arch>/` left a
+board that could not import anything: the shim was never installed, so the arch
+directory never reached `sys.path`, and the acceptance run in section 10 needed
+three files copied by hand. `build` now writes the installed `.mpy` files, the
+manifest, `lib/turbo.py` and the `src/<mod>.py` fallback for each module it
+built. `code.py` is still never touched. Files whose bytes already match are
+skipped, because every write to a CIRCUITPY drive costs an autoreload, and the
+summary names only what actually changed.
 
 ```
 $ turbo build src/
@@ -577,9 +586,10 @@ Integration (farm, `bravo`; see the `hil-farm` skill and
 - `turbo build` output for `examples/mandelbrot/src/pixels.py` is
   byte-identical to a direct `mpy-cross -march=<arch>` run of the rewritten
   source (`cmp` the `.viper.mpy`).
-- `turbo init && turbo build && ` copy to a board, then `code.py` from the
-  example prints `checksum=407644` (the shim test's known-good value from
-  `docs/shim-test.md`) with `path=/lib/turbo/<arch>`.
+- `turbo init && turbo build` provisions the board on its own; copy `code.py`,
+  which is yours, and the example prints `checksum=407644` (the shim test's
+  known-good value from `docs/shim-test.md`) with `path=/lib/turbo/<arch>`.
+  Confirmed 2026-09-08 on the RP2040 (422 ms) and ESP32-S3 (186 ms).
 - `turbo watch`: edit `src/pixels.py`, see the one-line report, board reloads.
 
 ## 11. Explicitly out of scope for this pass

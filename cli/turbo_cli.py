@@ -325,20 +325,62 @@ def build_module(mpy_cross, name, path, text, archs, out, echo=print):
     return entry, installed, ok, failures
 
 
-def copy_to_board(mount, out, installed, echo=print):
-    """Put the installed .mpy files and the manifest where the shim looks."""
-    n = 0
-    for arch, path in installed:
-        d = os.path.join(mount, "lib", "turbo", arch)
+def same_file(a, b):
+    try:
+        with open(a, "rb") as fa, open(b, "rb") as fb:
+            return fa.read() == fb.read()
+    except OSError:
+        return False
+
+
+def copy_if_changed(src, dest):
+    """Copy only when the bytes differ. Every write to a CIRCUITPY drive costs an
+    autoreload and a flash erase, so rewriting an identical shim on every build
+    restarts the user's program for nothing."""
+    if os.path.isfile(dest) and same_file(src, dest):
+        return False
+    d = os.path.dirname(dest)
+    if d:
         os.makedirs(d, exist_ok=True)
-        shutil.copyfile(path, os.path.join(d, os.path.basename(path)))
-        n += 1
+    shutil.copyfile(src, dest)
+    return True
+
+
+def shim_source(out):
+    """The shim to put on the board: the project's own if it has one, else the copy
+    bundled with the CLI. A user who edited theirs keeps their edit."""
+    local = os.path.join(os.path.dirname(out) or ".", "turbo.py")
+    for p in (os.path.join("lib", "turbo.py"), local):
+        if os.path.isfile(p):
+            return p
+    return asset("shim", "turbo.py")
+
+
+def copy_to_board(mount, out, installed, sources=(), echo=print):
+    """Put everything the board needs to import a compiled module: the .mpy files,
+    the manifest, the shim that puts the arch directory on sys.path, and the source
+    each module falls back to. Never code.py, which is the user's program.
+
+    Returns a description of what actually changed, or "" when nothing did."""
+    parts = []
+    n = sum(copy_if_changed(path, os.path.join(mount, "lib", "turbo", arch,
+                                               os.path.basename(path)))
+            for arch, path in installed)
+    if n:
+        parts.append("%d module%s" % (n, "" if n == 1 else "s"))
     manifest = os.path.join(out, "turbo.json")
-    if n and os.path.isfile(manifest):
-        shutil.copyfile(manifest, os.path.join(mount, "lib", "turbo", "turbo.json"))
-    if n and hasattr(os, "sync"):
+    if installed and os.path.isfile(manifest):
+        copy_if_changed(manifest, os.path.join(mount, "lib", "turbo", "turbo.json"))
+    shim = shim_source(out)
+    if installed and shim and copy_if_changed(shim, os.path.join(mount, "lib", "turbo.py")):
+        parts.append("shim")
+    n = sum(copy_if_changed(p, os.path.join(mount, "src", os.path.basename(p)))
+            for p in sources if os.path.isfile(p))
+    if n:
+        parts.append("%d source%s" % (n, "" if n == 1 else "s"))
+    if parts and hasattr(os, "sync"):
         os.sync()
-    return n
+    return ", ".join(parts)
 
 
 def cmd_build(a):
@@ -376,7 +418,7 @@ def cmd_build(a):
 
     manifest = load_manifest(a.out)
     built = failed = skipped = 0
-    installed = []
+    installed, sources = [], []
     for fn in sorted(os.listdir(a.src)):
         if not fn.endswith(".py"):
             continue
@@ -397,6 +439,8 @@ def cmd_build(a):
                                                              archs, a.out)
         entry.update(arch_entries)
         installed += module_installed
+        if module_installed:
+            sources.append(path)
         if ok:
             entry["sha256"] = new_sha
             built += 1
@@ -405,9 +449,9 @@ def cmd_build(a):
             failed += 1
     save_manifest(a.out, manifest)
 
-    copied = 0
+    copied = ""
     if installed and f["mount"] and not a.no_copy:
-        copied = copy_to_board(f["mount"], a.out, installed)
+        copied = copy_to_board(f["mount"], a.out, installed, sources)
     ms = int((time.monotonic() - t0) * 1000)
     parts = ["%d built" % built]
     if failed:
@@ -416,7 +460,9 @@ def cmd_build(a):
         parts.append("%d skipped" % skipped)
     parts.append("%d ms" % ms)
     if copied:
-        parts.append("copied %d to %s" % (copied, f["mount"]))
+        parts.append("copied %s to %s" % (copied, f["mount"]))
+    elif installed and f["mount"] and not a.no_copy:
+        parts.append("%s already up to date" % f["mount"])
     elif installed and not a.no_copy and not f["mount"]:
         parts.append("no CIRCUITPY drive, nothing copied")
     print(", ".join(parts))
@@ -1646,7 +1692,6 @@ def cmd_watch(a):
         return 1
 
     board_dir = os.path.join(f["mount"], "lib", "turbo", arch)
-    board_src = os.path.join(f["mount"], "src")
     print("watching %s  ->  %s" % (a.src.rstrip("/") + "/", board_dir + "/"))
 
     ser = None
@@ -1705,11 +1750,7 @@ def cmd_watch(a):
                         pass
                 copied = False
                 if installed:
-                    copy_to_board(f["mount"], a.out, installed)
-                    os.makedirs(board_src, exist_ok=True)
-                    shutil.copyfile(path, os.path.join(board_src, fn))
-                    if hasattr(os, "sync"):
-                        os.sync()
+                    copy_to_board(f["mount"], a.out, installed, [path])
                     copied = True
                 print(watch_report(fn, failures, variants, copied,
                                    saw_reload(ser) if copied else False,

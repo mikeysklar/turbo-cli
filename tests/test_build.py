@@ -85,17 +85,66 @@ def test_the_module_name_prints_once_across_arches(out, monkeypatch):
     assert set(entry) == {"armv6m", "armv7emsp"}
 
 
-def test_copy_to_board(tmp_path):
+def test_copy_to_board_puts_everything_the_shim_needs_there(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
     out = tmp_path / "lib" / "turbo"
     (out / "armv6m").mkdir(parents=True)
     mpy = out / "armv6m" / "pixels.mpy"
     mpy.write_bytes(b"\x00" * 10)
+    (tmp_path / "lib" / "turbo.py").write_text("# the project's shim\n")
+    (tmp_path / "src").mkdir()
+    src = tmp_path / "src" / "pixels.py"
+    src.write_text("from turbo import turbo\n")
     t.save_manifest(str(out), {"pixels": {"src": "src/pixels.py"}})
     mount = tmp_path / "CIRCUITPY"
     mount.mkdir()
-    assert t.copy_to_board(str(mount), str(out), [("armv6m", str(mpy))]) == 1
+
+    assert t.copy_to_board(str(mount), str(out), [("armv6m", str(mpy))],
+                           [str(src)]) == "1 module, shim, 1 source"
     assert (mount / "lib" / "turbo" / "armv6m" / "pixels.mpy").read_bytes() == b"\x00" * 10
+    assert (mount / "lib" / "turbo.py").read_text() == "# the project's shim\n"
+    assert (mount / "src" / "pixels.py").read_text() == "from turbo import turbo\n"
     assert json.loads((mount / "lib" / "turbo" / "turbo.json").read_text())["pixels"]
+    # a second run writes nothing: every write costs the board an autoreload
+    assert t.copy_to_board(str(mount), str(out), [("armv6m", str(mpy))], [str(src)]) == ""
+    # a changed module alone is reported alone
+    mpy.write_bytes(b"\x01" * 10)
+    assert t.copy_to_board(str(mount), str(out), [("armv6m", str(mpy))],
+                           [str(src)]) == "1 module"
+
+
+def test_copy_to_board_never_touches_code_py(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    out = tmp_path / "lib" / "turbo"
+    (out / "armv6m").mkdir(parents=True)
+    mpy = out / "armv6m" / "pixels.mpy"
+    mpy.write_bytes(b"\x00")
+    (tmp_path / "code.py").write_text("mine, on the host\n")
+    mount = tmp_path / "CIRCUITPY"
+    mount.mkdir()
+    (mount / "code.py").write_text("theirs, on the board\n")
+    t.copy_to_board(str(mount), str(out), [("armv6m", str(mpy))], [])
+    assert (mount / "code.py").read_text() == "theirs, on the board\n"
+
+
+def test_the_bundled_shim_is_used_when_the_project_has_none(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    out = tmp_path / "lib" / "turbo"
+    (out / "armv6m").mkdir(parents=True)
+    mpy = out / "armv6m" / "pixels.mpy"
+    mpy.write_bytes(b"\x00")
+    mount = tmp_path / "CIRCUITPY"
+    mount.mkdir()
+    assert "shim" in t.copy_to_board(str(mount), str(out), [("armv6m", str(mpy))], [])
+    assert (mount / "lib" / "turbo.py").read_text() == open(t.asset("shim", "turbo.py")).read()
+
+
+def test_shim_source_prefers_the_project(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    assert t.shim_source("lib/turbo") == t.asset("shim", "turbo.py")
+    (tmp_path / "lib").mkdir()
+    (tmp_path / "lib" / "turbo.py").write_text("# mine\n")
+    assert t.shim_source("lib/turbo") == os.path.join("lib", "turbo.py")
 
 
 @pytest.mark.parametrize("message, first_hint", [
