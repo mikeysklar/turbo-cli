@@ -1,5 +1,6 @@
 """turbo build: the report lines, the hint table and the manifest rules (SPEC 5.3,
 4.1 to 4.3, 6). compile_variant is stubbed, so no mpy-cross is needed."""
+import argparse
 import json
 import os
 import sys
@@ -184,3 +185,24 @@ def test_compiler_error_without_a_traceback():
 def test_thousands():
     assert t.thousands(639) == "639"
     assert t.thousands(1204) == "1,204"
+
+
+def test_build_on_stock_firmware_says_arch_0_not_no_board(tmp_path, monkeypatch, capsys):
+    """A stock board is found; it just has no loader. Calling it missing sends the
+    user looking for a cable instead of for firmware."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "src").mkdir()
+    monkeypatch.setattr(t, "board_facts", lambda a: {
+        "mount": "/media/sklarm/CIRCUITPY", "mounts": 1, "port": "/dev/ttyACM18",
+        "port_errors": [], "mpy": 0x0306, "arch": None, "abi": "6.3",
+        "arch_source": "probe",
+        "boot": {"version": "10.3.0", "board_id": "adafruit_metro_rp2040",
+                 "board_name": "Adafruit Metro RP2040"}})
+    a = argparse.Namespace(src="src", out="lib/turbo", arch=None, mpy_cross=None,
+                           offline=True, verbose=False, no_copy=True, port=None,
+                           mount=None, board=None)
+    assert t.cmd_build(a) == 1
+    out = capsys.readouterr().out
+    assert "_mpy        0x0306   arch 0, no native loader" in out
+    assert "Flash turbo firmware for adafruit_metro_rp2040" in out
+    assert "no board found" not in out

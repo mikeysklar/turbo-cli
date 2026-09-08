@@ -580,6 +580,13 @@ Integration (farm, `bravo`; see the `hil-farm` skill and
 `adafruit-turbo/tools/farm/deploy-test.sh`):
 
 - `turbo doctor` on a stock 10.3.0 board prints the arch-0 sentence and exits 1.
+  Confirmed 2026-09-08: the farm Metro RP2040 flashed to stock reports
+  `_mpy 0x0306`, and `build`, `watch` and `init` print the same diagnosis
+  rather than claiming no board was found. `init` still lays the project out,
+  because the shim and the `/src` fallback are exactly what a stock board needs;
+  it skips only the arch directory. The sentence's claim was checked on that
+  board: `arch=None path=/src checksum=407644` in 8330 ms, against 422 ms
+  compiled.
 - `turbo doctor` on each loader-only board prints the right arch: RP2040
   `armv6m`, RP2350/M4/nRF52840/STM32F405 `armv7emsp`, ESP32-S2/S3
   `xtensawin`, C5 `rv32imc`.

@@ -393,9 +393,9 @@ def cmd_build(a):
     elif f["arch"]:
         archs = [f["arch"]]
     else:
-        print("no board found")
-        print("   No CIRCUITPY drive and no serial port. Plug the board in, or pass")
-        print("   --mount DIR and --port TTY, or --arch NAME to build without a board.")
+        # Could be no board at all, or a board with no native loader. doctor knows
+        # the difference and says which; build must not call a stock board missing.
+        doctor_lines(f, offline=True, out=a.out, src=a.src, echo=print)
         return 1
     unknown = [x for x in archs if x not in ARCH_ID]
     if unknown:
@@ -1365,8 +1365,11 @@ def cmd_init(a):
     f = board_facts(a)
     arch = f["arch"]
     if not arch:
+        # Stock firmware, or no board yet. The shim and the /src fallback work
+        # everywhere, so the project is still worth laying out; only the arch
+        # directory has to wait. Refusing here would leave a stock user, the exact
+        # person the identity decorators are for, with nothing.
         doctor_lines(f, offline=True, out=a.out, src=a.src, echo=print)
-        return 1
 
     def report(verb, path, note):
         print("%-7s%-26s%s" % (verb, path, note))
@@ -1398,7 +1401,13 @@ def cmd_init(a):
     copy(shim, os.path.join("lib", "turbo.py"),
          "shim, %d lines, identity decorators on stock firmware" % n)
     make_dir(a.src, "your source, kept off sys.path so it never shadows .mpy")
-    make_dir(os.path.join(a.out, arch), "where compiled modules land")
+    if arch:
+        make_dir(os.path.join(a.out, arch), "where compiled modules land")
+    else:
+        # "skip", not "skipped": the verb column is 7 wide and 7 characters would
+        # leave no gap before the path
+        report("skip", os.path.join(a.out, "<arch>") + "/",
+               "no arch yet; run again with a turbo board, or --arch NAME")
 
     if a.example:
         ex = asset("examples", "mandelbrot")
@@ -1666,9 +1675,7 @@ def cmd_watch(a):
     f = board_facts(a)
     arch = a.arch or f["arch"]
     if not arch:
-        print("no board found")
-        print("   No CIRCUITPY drive and no serial port. Plug the board in, or pass")
-        print("   --mount DIR and --port TTY, or --arch NAME to build without a board.")
+        doctor_lines(f, offline=True, out=a.out, src=a.src, echo=print)
         return 1
     if arch not in ARCH_ID:
         print("unknown arch %s" % arch)

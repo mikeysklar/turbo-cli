@@ -27,6 +27,14 @@ def project(tmp_path, monkeypatch, capsys):
     return tmp_path
 
 
+def test_every_verb_leaves_a_gap_before_the_path(project, capsys):
+    t.cmd_init(args(arch=None, example=True))
+    for line in capsys.readouterr().out.splitlines():
+        if line[:1].isalpha() and not line.startswith(("board", "port", "drive",
+                                                       "firmware", "_mpy", "no ")):
+            assert line[6] == " ", line
+
+
 def test_creates_the_layout(project, capsys):
     assert t.cmd_init(args()) == 0
     out = capsys.readouterr().out.splitlines()
@@ -78,10 +86,19 @@ def test_example_leaves_an_existing_code_py_alone(project, capsys):
     assert (project / "code.py").read_text() == "print('mine')\n"
 
 
-def test_no_arch_explains_instead_of_guessing(project, capsys):
-    assert t.cmd_init(args(arch=None)) == 1
-    assert capsys.readouterr().out.startswith("no board found")
-    assert not (project / "lib").exists()
+def test_no_arch_still_lays_out_the_project(project, capsys):
+    """A stock board is the case the shim exists for: it runs from /src. Refusing
+    to init would leave exactly that user with nothing."""
+    assert t.cmd_init(args(arch=None, example=True)) == 0
+    out = capsys.readouterr().out
+    assert out.startswith("no board found")          # says why, first
+    assert (project / "lib" / "turbo.py").is_file()  # the shim, which works on stock
+    assert (project / "src" / "pixels.py").is_file()
+    assert (project / "code.py").is_file()
+    assert not (project / "lib" / "turbo").exists()  # no arch dir to make yet
+    assert "%-7s%-26s%s" % ("skip", "lib/turbo/<arch>/",
+                            "no arch yet; run again with a turbo board, "
+                            "or --arch NAME") in out
 
 
 def test_assets_are_present_in_the_checkout():
