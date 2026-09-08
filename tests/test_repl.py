@@ -170,3 +170,12 @@ def test_soft_reset_times_out_if_the_board_does_not_come_back():
     with pytest.raises(r.REPLError) as e:
         repl.soft_reset(timeout=0.05)
     assert "soft reboot banner" in str(e.value)
+
+
+def test_resume_leaves_raw_mode_then_reloads():
+    repl, fake = make(RAW)
+    repl.enter_raw()
+    repl.resume()
+    # Ctrl-B out of raw mode, then Ctrl-D so CircuitPython runs code.py again
+    assert bytes(fake.written).endswith(b"\r\x02\r\x04")
+    assert not repl._raw

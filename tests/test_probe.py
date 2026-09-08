@@ -99,3 +99,29 @@ def test_find_mounts(tmp_path, monkeypatch):
     monkeypatch.setattr(t, "_mount_candidates", lambda system: iter([str(a), str(b)]))
     found = t.find_mounts(board="adafruit_metro_rp2350")
     assert [f["board_id"] for _, f in found] == ["adafruit_metro_rp2350", "adafruit_metro_esp32s3"]
+
+
+def test_linux_sees_numbered_drives(monkeypatch):
+    """A farm host mounts eight boards as CIRCUITPY, CIRCUITPY1 ... CIRCUITPY7."""
+    seen = []
+
+    def fake_glob(pattern):
+        seen.append(pattern)
+        if pattern == "/media/*/CIRCUITPY*":
+            return ["/media/sklarm/CIRCUITPY", "/media/sklarm/CIRCUITPY1",
+                    "/media/sklarm/CIRCUITPY7"]
+        return []
+
+    monkeypatch.delenv("CIRCUITPY_MOUNT", raising=False)
+    monkeypatch.setattr(t.glob, "glob", fake_glob)
+    assert list(t._mount_candidates("Linux")) == [
+        "/media/sklarm/CIRCUITPY", "/media/sklarm/CIRCUITPY1", "/media/sklarm/CIRCUITPY7"]
+    assert "/media/*/CIRCUITPY*" in seen
+
+
+def test_macos_sees_numbered_drives(monkeypatch):
+    monkeypatch.delenv("CIRCUITPY_MOUNT", raising=False)
+    monkeypatch.setattr(t.glob, "glob",
+                        lambda p: ["/Volumes/CIRCUITPY", "/Volumes/CIRCUITPY 1"])
+    assert list(t._mount_candidates("Darwin")) == ["/Volumes/CIRCUITPY",
+                                                   "/Volumes/CIRCUITPY 1"]

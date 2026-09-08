@@ -136,6 +136,13 @@ class RawREPL:
         self.ser.write(b"\r\x02")
         self._raw = False
 
+    def resume(self):
+        """Leave the board running its own code.py. Entering the REPL, which the
+        probe does, turns CircuitPython's autoreload off; Ctrl-D reloads and turns it
+        back on. watch needs this or a saved file never reaches the running program."""
+        self.exit_raw()
+        self.ser.write(b"\r\x04")
+
 
 def parse_probe(out, err):
     """(mpy, version) from the PROBE line. mpy is 0 when the firmware has no

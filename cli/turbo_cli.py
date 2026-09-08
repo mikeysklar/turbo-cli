@@ -105,7 +105,8 @@ def _mount_candidates(system):
         for p in sorted(glob.glob("/Volumes/CIRCUITPY*")):
             yield p
     elif system == "Linux":
-        for pat in ("/media/*/CIRCUITPY", "/run/media/*/CIRCUITPY", "/mnt/CIRCUITPY"):
+        # numbered too: a second board mounts as CIRCUITPY1, an eighth as CIRCUITPY7
+        for pat in ("/media/*/CIRCUITPY*", "/run/media/*/CIRCUITPY*", "/mnt/CIRCUITPY*"):
             for p in sorted(glob.glob(pat)):
                 yield p
     elif system == "Windows":
@@ -193,12 +194,17 @@ def rewrite(src_text, tier):
 
 
 def compile_variant(mpy_cross, text, name, arch, dest):
+    """Compile one rewritten module. mpy-cross embeds the source path exactly as it
+    is given on the command line, so it is run from inside the temp directory with a
+    bare basename: otherwise every build carries a different /tmp/tmpXXXX/ path,
+    binaries are not reproducible, and a traceback on the board names a directory
+    that never existed on the user's machine."""
+    dest = os.path.abspath(dest)
     with tempfile.TemporaryDirectory() as td:
-        src = os.path.join(td, name + ".py")
-        with open(src, "w") as f:
+        with open(os.path.join(td, name + ".py"), "w") as f:
             f.write(text)
-        r = subprocess.run([mpy_cross, "-march=" + arch, src, "-o", dest],
-                           capture_output=True, text=True)
+        r = subprocess.run([mpy_cross, "-march=" + arch, name + ".py", "-o", dest],
+                           capture_output=True, text=True, cwd=td)
     if r.returncode:
         # the whole thing: build wants the `File "...", line N` line too (SPEC 4.2)
         return r.stderr.strip() or "mpy-cross failed"
@@ -1196,7 +1202,10 @@ def doctor_lines(f, mpy_cross=None, offline=False, out="lib/turbo", src="src", e
             return lines, False
 
     if boot.get("board_name") or boot.get("board_id"):
-        row("board", "%-30s%s" % (boot.get("board_name") or "?", boot.get("board_id") or ""))
+        # ljust, not %-30s: "Adafruit Feather nRF52840 Express" is longer than the
+        # column and would run straight into the board id
+        row("board", "%s  %s" % ((boot.get("board_name") or "?").ljust(28),
+                                 boot.get("board_id") or ""))
     if f["port"]:
         row("port", f["port"])
     if f["mount"]:
@@ -1627,6 +1636,14 @@ def cmd_watch(a):
         try:
             import turbo_repl
             ser = turbo_repl.serial.Serial(f["port"], turbo_repl.BAUD, timeout=0.1)
+            # The probe left the board at the REPL prompt, where CircuitPython turns
+            # autoreload off. Without this Ctrl-D a saved file is copied and nothing
+            # on the board ever notices. Measured on the farm: reload seen while the
+            # program runs, not seen after a probe, seen again after Ctrl-D.
+            ser.write(b"\r\x04")
+            time.sleep(1.0)
+            ser.reset_input_buffer()
+            print("board resumed; autoreload is on")
         except Exception:
             ser = None  # the reload banner is a nicety, never a reason to stop
 

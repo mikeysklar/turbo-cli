@@ -34,6 +34,15 @@ def test_ready_block(tmp_path):
     assert lines[-1] == "ready       turbo build compiles -march=xtensawin"
 
 
+def test_a_long_board_name_still_leaves_a_gap(tmp_path):
+    f = facts()
+    f["boot"]["board_name"] = "Adafruit Feather nRF52840 Express"
+    f["boot"]["board_id"] = "feather_nrf52840_express"
+    lines, _ = t.doctor_lines(f, offline=True, src=str(tmp_path / "none"))
+    assert lines[0] == ("board       Adafruit Feather nRF52840 Express  "
+                        "feather_nrf52840_express")
+
+
 def test_stock_firmware_is_arch_zero(tmp_path):
     lines, ready = t.doctor_lines(facts(mpy=0x0306, arch=None, abi="6.3"),
                                   src=str(tmp_path / "none"))
