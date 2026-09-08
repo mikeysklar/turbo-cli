@@ -9,6 +9,7 @@ bench the candidates on a board, install the winner, keep a manifest.
     turbo_cli.py check  SRC_DIR [--out lib/turbo]
     turbo_cli.py analyze SRC [--arch A | --board B] [--json]
     turbo_cli.py verify BASELINE.py CANDIDATE.py --fn NAME [--inputs FILE.py]
+    turbo_cli.py watch  [SRC=src]
     turbo_cli.py pack   PROJECT --board B --firmware FW.uf2 [-o out.uf2]
     turbo_cli.py pack   PROJECT --self-extract [-o code.py]
 
@@ -266,7 +267,7 @@ def build_module(mpy_cross, name, path, text, archs, out, echo=print):
     """Compile one module for every arch. Prints the report lines (SPEC 5.3) and
     returns (manifest entry fields, installed paths, ok). ok is False when some arch
     ended with nothing installable, which is what makes build exit 1."""
-    entry, installed, ok = {}, [], True
+    entry, installed, ok, failures = {}, [], True, []
     label = name
     for arch in archs:
         d = os.path.join(out, arch)
@@ -296,6 +297,7 @@ def build_module(mpy_cross, name, path, text, archs, out, echo=print):
 
         if "viper" in errors:
             loc, message, hint = compiler_error(errors["viper"], path)
+            failures.append((arch, "viper", loc, message))
             echo("%-11s%-8s%s" % (label, "FAILED", loc))
             echo(" " * 11 + message)
             for h in hint:
@@ -311,8 +313,10 @@ def build_module(mpy_cross, name, path, text, archs, out, echo=print):
             echo(line)
         if not pick:
             ok = False
+            if "native" in errors:
+                failures.append((arch, "native") + compiler_error(errors["native"], path)[:2])
         label = ""
-    return entry, installed, ok
+    return entry, installed, ok, failures
 
 
 def copy_to_board(mount, out, installed, echo=print):
@@ -383,8 +387,8 @@ def cmd_build(a):
         # The hash is written only when every arch built, so a failure leaves
         # `check` reporting STALE rather than "fresh".
         new_sha = sha256(path)
-        arch_entries, module_installed, ok = build_module(mpy_cross, name, path, text,
-                                                          archs, a.out)
+        arch_entries, module_installed, ok, _ = build_module(mpy_cross, name, path, text,
+                                                             archs, a.out)
         entry.update(arch_entries)
         installed += module_installed
         if ok:
@@ -1487,6 +1491,162 @@ def cmd_verify(a):
 
 
 
+# ---------------------------------------------------------------- watch
+
+POLL = 0.5  # seconds; polling keeps the dependency list at pyserial (SPEC 5.6)
+RELOAD_WAIT = 3.0
+RELOAD_BANNER = b"soft reboot"
+
+
+def source_mtimes(src):
+    out = {}
+    for fn in os.listdir(src):
+        if fn.endswith(".py"):
+            try:
+                out[fn] = os.path.getmtime(os.path.join(src, fn))
+            except OSError:
+                pass  # deleted between listdir and stat
+    return out
+
+
+def saw_reload(ser, timeout=RELOAD_WAIT):
+    """True when the board prints its soft reboot banner within `timeout`. The port
+    stays open across the whole watch, so the banner is not missed while copying."""
+    if ser is None:
+        return False
+    deadline = time.monotonic() + timeout
+    buf = bytearray()
+    while time.monotonic() < deadline:
+        try:
+            buf.extend(ser.read(getattr(ser, "in_waiting", 0) or 1))
+        except Exception:
+            return False
+        if RELOAD_BANNER in buf.lower():
+            return True
+    return False
+
+
+def watch_report(name, failures, variants, copied, reloaded, tier=None):
+    """The one line SPEC 5.6 prints per change."""
+    parts = []
+    if failures:
+        _, _, loc, message = failures[0]
+        parts.append("FAILED %s" % loc)
+        parts.append(message if len(message) <= 50 else message[:47] + "...")
+    else:
+        parts.append("rebuilt %d variant%s" % (variants, "" if variants == 1 else "s"))
+    if copied and failures:
+        parts.append("copied as %s" % (tier or "?"))  # viper lost, the module still ships
+    else:
+        parts.append("copied" if copied else "not copied")
+    if reloaded:
+        parts.append("board reloaded")
+    return "%s  %-20s%s" % (time.strftime("%H:%M:%S"), name + " changed",
+                            "   ".join(parts))
+
+
+def cmd_watch(a):
+    f = board_facts(a)
+    arch = a.arch or f["arch"]
+    if not arch:
+        print("no board found")
+        print("   No CIRCUITPY drive and no serial port. Plug the board in, or pass")
+        print("   --mount DIR and --port TTY, or --arch NAME to build without a board.")
+        return 1
+    if arch not in ARCH_ID:
+        print("unknown arch %s" % arch)
+        print("   Known: %s." % ", ".join(sorted(ARCH_ID)))
+        return 1
+    if not os.path.isdir(a.src):
+        print("no source directory %s" % a.src)
+        print("   turbo watch reads .py files from src/.   turbo init")
+        return 1
+    if not f["mount"]:
+        print("no CIRCUITPY drive")
+        print("   turbo watch and turbo build copy need a drive. Pass --mount DIR, or")
+        print("   use turbo build --no-copy and copy lib/turbo/ yourself.")
+        return 1
+    mpy_cross, lines = resolve_toolchain(f["boot"].get("version"), f["abi"],
+                                         a.mpy_cross, a.offline)
+    if a.verbose or not mpy_cross or any("fetching" in l for l in lines):
+        for line in lines:
+            print(line)
+    if not mpy_cross:
+        return 1
+
+    board_dir = os.path.join(f["mount"], "lib", "turbo", arch)
+    board_src = os.path.join(f["mount"], "src")
+    print("watching %s  ->  %s" % (a.src.rstrip("/") + "/", board_dir + "/"))
+
+    ser = None
+    if f["port"]:
+        try:
+            import turbo_repl
+            ser = turbo_repl.serial.Serial(f["port"], turbo_repl.BAUD, timeout=0.1)
+        except Exception:
+            ser = None  # the reload banner is a nicety, never a reason to stop
+
+    seen = source_mtimes(a.src)
+    try:
+        while True:
+            time.sleep(POLL)
+            now = source_mtimes(a.src)
+            for fn in sorted(now):
+                if seen.get(fn) == now[fn]:
+                    continue
+                seen[fn] = now[fn]
+                path = os.path.join(a.src, fn)
+                name = fn[:-3]
+                try:
+                    with open(path) as fh:
+                        text = fh.read()
+                except OSError:
+                    continue
+                if rewrite(text, "native") is None:
+                    print("%s  %-20s%s" % (time.strftime("%H:%M:%S"), fn + " changed",
+                                           "no @turbo decorator   not copied"))
+                    continue
+                manifest = load_manifest(a.out)
+                entry = manifest.setdefault(name, {})
+                entry["src"] = os.path.relpath(path)
+                arch_entries, installed, ok, failures = build_module(
+                    mpy_cross, name, path, text, [arch], a.out, echo=lambda _: None)
+                entry.update(arch_entries)
+                if ok:
+                    entry["sha256"] = sha256(path)
+                else:
+                    entry.pop("sha256", None)
+                save_manifest(a.out, manifest)
+                variants = sum(1 for v in arch_entries[arch]["candidates"].values()
+                               if isinstance(v, int))
+                if ser is not None:
+                    try:
+                        ser.reset_input_buffer()  # only count a reload caused by this write
+                    except Exception:
+                        pass
+                copied = False
+                if installed:
+                    copy_to_board(f["mount"], a.out, installed)
+                    os.makedirs(board_src, exist_ok=True)
+                    shutil.copyfile(path, os.path.join(board_src, fn))
+                    if hasattr(os, "sync"):
+                        os.sync()
+                    copied = True
+                print(watch_report(fn, failures, variants, copied,
+                                   saw_reload(ser) if copied else False,
+                                   arch_entries[arch]["installed"]))
+    except KeyboardInterrupt:
+        print("")
+        return 0
+    finally:
+        if ser is not None:
+            try:
+                ser.close()
+            except Exception:
+                pass
+
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1534,6 +1694,17 @@ def main():
                    help="a compiled tier must beat the bytecode median by this factor (default 1.05)")
     n.add_argument("--pyboard-tools", default=os.path.expanduser("~/cp-1030/tools"))
     n.set_defaults(run=cmd_bench)
+    w = sub.add_parser("watch", help="rebuild and copy a module every time you save it")
+    w.add_argument("src", nargs="?", default="src")
+    w.add_argument("--out", default="lib/turbo")
+    w.add_argument("--mpy-cross")
+    w.add_argument("--arch")
+    w.add_argument("--port")
+    w.add_argument("--mount")
+    w.add_argument("--board")
+    w.add_argument("--offline", action="store_true")
+    w.add_argument("-v", "--verbose", action="store_true")
+    w.set_defaults(run=cmd_watch)
     c = sub.add_parser("check")
     c.add_argument("src")
     c.add_argument("--out", default="lib/turbo")

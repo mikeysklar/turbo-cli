@@ -37,14 +37,14 @@ def out(tmp_path, monkeypatch):
 def run(monkeypatch, sizes, archs=("xtensawin",), out="lib/turbo"):
     monkeypatch.setattr(t, "compile_variant", stub(sizes))
     lines = []
-    entry, installed, ok = t.build_module("mpy-cross", "pixels", "src/pixels.py",
-                                          "@turbo\ndef f(): pass\n", list(archs), out,
-                                          echo=lines.append)
-    return lines, entry, installed, ok
+    entry, installed, ok, failures = t.build_module(
+        "mpy-cross", "pixels", "src/pixels.py", "@turbo\ndef f(): pass\n", list(archs),
+        out, echo=lines.append)
+    return lines, entry, installed, ok, failures
 
 
 def test_both_tiers_compile(out, monkeypatch):
-    lines, entry, installed, ok = run(monkeypatch, {"viper": 639, "native": 1204})
+    lines, entry, installed, ok, failures = run(monkeypatch, {"viper": 639, "native": 1204})
     assert ok
     assert lines == ["pixels     viper   xtensawin    639 B      native   1,204 B"]
     assert entry["xtensawin"]["installed"] == "viper"
@@ -55,7 +55,7 @@ def test_both_tiers_compile(out, monkeypatch):
 
 
 def test_viper_fails_native_ships(out, monkeypatch):
-    lines, entry, installed, ok = run(monkeypatch, {"viper": VIPER_ERR, "native": 1204})
+    lines, entry, installed, ok, failures = run(monkeypatch, {"viper": VIPER_ERR, "native": 1204})
     assert ok  # the module still ships, just slower
     assert lines[0] == "pixels     FAILED  src/pixels.py:5"
     assert lines[1] == "           ViperTypeError: can't do binary op between 'int' and 'object'"
@@ -69,7 +69,7 @@ def test_both_tiers_fail(out, monkeypatch):
     os.makedirs("lib/turbo/xtensawin")
     stale = "lib/turbo/xtensawin/pixels.mpy"
     open(stale, "wb").write(b"old")
-    lines, entry, installed, ok = run(monkeypatch, {"viper": VIPER_ERR, "native": VIPER_ERR})
+    lines, entry, installed, ok, failures = run(monkeypatch, {"viper": VIPER_ERR, "native": VIPER_ERR})
     assert not ok
     assert installed == []
     assert entry["xtensawin"]["installed"] is None
@@ -78,7 +78,7 @@ def test_both_tiers_fail(out, monkeypatch):
 
 
 def test_the_module_name_prints_once_across_arches(out, monkeypatch):
-    lines, entry, _, ok = run(monkeypatch, {"viper": 604, "native": 900},
+    lines, entry, _, ok, _ = run(monkeypatch, {"viper": 604, "native": 900},
                               archs=("armv6m", "armv7emsp"))
     assert lines[0].startswith("pixels     viper   armv6m")
     assert lines[1].startswith("           viper   armv7emsp")
