@@ -1,0 +1,9 @@
+build/
+dist/
+*.egg-info/
+lib/turbo/
+*.mpy
+*.uf2
+__pycache__/
+.DS_Store
+.venv/
