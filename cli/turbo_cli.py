@@ -16,9 +16,11 @@ differs from bytecode. The shim (lib/turbo.py) picks the arch dir at runtime.
 """
 import argparse
 import ast
+import glob
 import hashlib
 import json
 import os
+import platform
 import re
 import shutil
 import subprocess
@@ -30,6 +32,134 @@ ARCHES = ["armv6m", "armv7emsp"]
 ARCH_ID = {"armv6m": 4, "armv7m": 5, "armv7em": 6, "armv7emsp": 7, "armv7emdp": 8,
            "xtensa": 9, "xtensawin": 10, "rv32imc": 11}
 DECO = re.compile(r"^(\s*)@turbo(\.native|\.viper)?\s*$")
+
+# ---------------------------------------------------------------- board facts
+# Pure functions, no serial. Sources: SPEC.md 2.1 to 2.4 and 7.1.
+
+ARCH_NAME = {v: k for k, v in ARCH_ID.items()}  # 0 is absent: no native loader
+
+MPY_CROSS_BASE = "https://adafruit-circuit-python.s3.amazonaws.com/bin/mpy-cross/"
+# platform key -> path under MPY_CROSS_BASE, with %s for the CircuitPython version
+MPY_CROSS_PATH = {
+    "macos-arm64": "macos/mpy-cross-macos-%s-arm64",
+    "linux-amd64": "linux-amd64/mpy-cross-linux-amd64-%s.static",
+    "linux-aarch64": "linux-aarch64/mpy-cross-linux-aarch64-%s.static-aarch64",
+    "linux-raspbian": "linux-raspbian/mpy-cross-linux-raspbian-%s.static-raspbian",
+    "windows": "windows/mpy-cross-windows-%s.static.exe",
+}
+
+
+def decode_mpy(mpy):
+    """Decode sys.implementation._mpy (py/persistentcode.h). Returns a dict with
+    version, sub, arch_id, arch (name, or None when arch_id is 0: no native loader)
+    and abi ("6.3")."""
+    version, sub, arch_id = mpy & 0xff, (mpy >> 8) & 3, (mpy >> 10) & 0x3f
+    return {"version": version, "sub": sub, "arch_id": arch_id,
+            "arch": ARCH_NAME.get(arch_id), "abi": "%d.%d" % (version, sub)}
+
+
+def parse_boot_out(text):
+    """Parse boot_out.txt (main.c:880). Only the first lines matter; boot.py output
+    may follow. Returns version, build_date, board_name, machine, board_id, uid;
+    each None when absent. Same split as circup backends.py:257."""
+    lines = text.splitlines()
+    facts = dict.fromkeys(("version", "build_date", "board_name", "machine", "board_id", "uid"))
+    if lines and lines[0].startswith("Adafruit CircuitPython "):
+        head, _, tail = lines[0].partition(";")
+        words = head.split(" ")
+        if len(words) >= 5:
+            facts["version"], facts["build_date"] = words[-3], words[-1]
+        name, sep, machine = tail.strip().rpartition(" with ")
+        facts["board_name"] = name if sep else (tail.strip() or None)
+        facts["machine"] = machine if sep else None
+    for line in lines[1:3]:
+        if line.startswith("Board ID:"):
+            facts["board_id"] = line[9:].strip() or None
+        elif line.startswith("UID:"):
+            facts["uid"] = line[4:].strip() or None
+    return facts
+
+
+def read_boot_out(mount):
+    """boot_out.txt facts for a mount, or None if the file is unreadable."""
+    try:
+        with open(os.path.join(mount, "boot_out.txt"), errors="replace") as f:
+            return parse_boot_out(f.read())
+    except OSError:
+        return None
+
+
+def _mount_candidates(system):
+    env = os.environ.get("CIRCUITPY_MOUNT")
+    if env:
+        yield env
+    if system == "Darwin":
+        # macOS names a second board "CIRCUITPY 1"
+        for p in sorted(glob.glob("/Volumes/CIRCUITPY*")):
+            yield p
+    elif system == "Linux":
+        for pat in ("/media/*/CIRCUITPY", "/run/media/*/CIRCUITPY", "/mnt/CIRCUITPY"):
+            for p in sorted(glob.glob(pat)):
+                yield p
+    elif system == "Windows":
+        for letter in "DEFGHIJKLMNOPQRSTUVWXYZ":
+            root = letter + ":\\"
+            if os.path.exists(root) and _volume_label(root) == "CIRCUITPY":
+                yield root
+
+
+def _volume_label(root):
+    try:
+        import ctypes
+        buf = ctypes.create_unicode_buffer(261)
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(root, buf, 261, None, None, None,
+                                                          None, 0)
+        return buf.value if ok else None
+    except Exception:
+        return None
+
+
+def find_mounts(explicit=None, board=None, system=None):
+    """CIRCUITPY drives (SPEC 7.1), preferred first. A path counts only if it holds
+    a readable boot_out.txt. `explicit` (--mount) is the only candidate when given.
+    With `board`, a drive whose Board ID matches moves to the front."""
+    system = system or platform.system()
+    cands = [explicit] if explicit else list(_mount_candidates(system))
+    found, seen = [], set()
+    for p in cands:
+        p = os.path.normpath(p)
+        if p in seen:
+            continue
+        seen.add(p)
+        facts = read_boot_out(p)
+        if facts:
+            found.append((p, facts))
+    if board:
+        found.sort(key=lambda pf: pf[1]["board_id"] != board)
+    return found
+
+
+def platform_key(system=None, machine=None):
+    """Key into MPY_CROSS_PATH for this host, or None when Adafruit publishes no
+    binary (macOS x86_64, and anything else unlisted)."""
+    system = system or platform.system()
+    machine = machine or platform.machine()
+    if system == "Darwin" and machine == "arm64":
+        return "macos-arm64"
+    if system == "Linux":
+        return {"x86_64": "linux-amd64", "aarch64": "linux-aarch64",
+                "armv7l": "linux-raspbian"}.get(machine)
+    if system == "Windows" and machine == "AMD64":
+        return "windows"
+    return None
+
+
+def mpy_cross_url(version, key):
+    """Download URL for the official mpy-cross of CircuitPython `version` on host
+    platform `key` (see platform_key). Beta/RC/dev versions are not published;
+    the caller learns that from the 404, not from this function."""
+    return MPY_CROSS_BASE + MPY_CROSS_PATH[key] % version
+
 
 
 def sha256(path):
