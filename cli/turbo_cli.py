@@ -356,6 +356,17 @@ def shim_source(out):
     return asset("shim", "turbo.py")
 
 
+def board_write_lines(mount, err):
+    """What to say when the drive will not take a write. Seen on the farm when the
+    kernel remounted a CIRCUITPY drive read-only after an I/O error; also happens
+    whenever CircuitPython has claimed the filesystem for itself."""
+    return ["%s   %s" % (mount, getattr(err, "strerror", None) or err),
+            "   CircuitPython may have the filesystem for itself (a storage.remount in",
+            "   boot.py, or safe mode), or the host remounted it after an I/O error.",
+            "   Reset or replug the board and run again, or use --no-copy and copy",
+            "   lib/turbo/ to the board yourself."]
+
+
 def copy_to_board(mount, out, installed, sources=(), echo=print):
     """Put everything the board needs to import a compiled module: the .mpy files,
     the manifest, the shim that puts the arch directory on sys.path, and the source
@@ -449,9 +460,16 @@ def cmd_build(a):
             failed += 1
     save_manifest(a.out, manifest)
 
-    copied = ""
+    copied, write_error = "", None
     if installed and f["mount"] and not a.no_copy:
-        copied = copy_to_board(f["mount"], a.out, installed, sources)
+        try:
+            copied = copy_to_board(f["mount"], a.out, installed, sources)
+        except OSError as e:
+            # The modules compiled; only the drive refused. Say so, and do not end
+            # a successful build with a traceback.
+            write_error = e
+            for line in board_write_lines(f["mount"], e):
+                print(line)
     ms = int((time.monotonic() - t0) * 1000)
     parts = ["%d built" % built]
     if failed:
@@ -459,14 +477,16 @@ def cmd_build(a):
     if skipped:
         parts.append("%d skipped" % skipped)
     parts.append("%d ms" % ms)
-    if copied:
+    if write_error:
+        parts.append("built but not copied")
+    elif copied:
         parts.append("copied %s to %s" % (copied, f["mount"]))
     elif installed and f["mount"] and not a.no_copy:
         parts.append("%s already up to date" % f["mount"])
     elif installed and not a.no_copy and not f["mount"]:
         parts.append("no CIRCUITPY drive, nothing copied")
     print(", ".join(parts))
-    return 1 if failed else 0
+    return 1 if failed or write_error else 0
 
 
 def board_exec(repl, code, timeout=600):
@@ -1757,8 +1777,13 @@ def cmd_watch(a):
                         pass
                 copied = False
                 if installed:
-                    copy_to_board(f["mount"], a.out, installed, [path])
-                    copied = True
+                    try:
+                        copy_to_board(f["mount"], a.out, installed, [path])
+                        copied = True
+                    except OSError as e:
+                        # keep watching: the user can reset the board and save again
+                        for line in board_write_lines(f["mount"], e):
+                            print(line)
                 print(watch_report(fn, failures, variants, copied,
                                    saw_reload(ser) if copied else False,
                                    arch_entries[arch]["installed"]))

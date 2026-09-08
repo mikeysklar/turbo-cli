@@ -467,6 +467,12 @@ no CIRCUITPY drive
    turbo watch and turbo build copy need a drive. Pass --mount DIR, or
    use turbo build --no-copy and copy lib/turbo/ yourself.
 
+/media/sklarm/CIRCUITPY   Read-only file system
+   CircuitPython may have the filesystem for itself (a storage.remount in
+   boot.py, or safe mode), or the host remounted it after an I/O error.
+   Reset or replug the board and run again, or use --no-copy and copy
+   lib/turbo/ to the board yourself.
+
 ViperTypeError: can't do binary op between 'int' and 'object'
    a float reached a viper function; scale to integers
 ViperTypeError: local 'x' has type 'int' but source is 'object'

@@ -206,3 +206,30 @@ def test_build_on_stock_firmware_says_arch_0_not_no_board(tmp_path, monkeypatch,
     assert "_mpy        0x0306   arch 0, no native loader" in out
     assert "Flash turbo firmware for adafruit_metro_rp2040" in out
     assert "no board found" not in out
+
+
+def test_a_drive_that_will_not_take_a_write_gets_a_sentence(tmp_path, monkeypatch, capsys):
+    """Seen on the farm: the kernel remounted a CIRCUITPY drive read-only after an
+    I/O error. The modules had compiled; only the copy failed."""
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "pixels.py").write_text("from turbo import turbo\n\n\n@turbo\ndef f():\n    pass\n")
+    mount = tmp_path / "CIRCUITPY"
+    mount.mkdir()
+    monkeypatch.setattr(t, "board_facts", lambda a: {
+        "mount": str(mount), "mounts": 1, "port": None, "port_errors": [], "mpy": 0x1306,
+        "arch": "armv6m", "abi": "6.3", "arch_source": "probe",
+        "boot": {"version": "10.3.0", "board_id": "adafruit_metro_rp2040"}})
+    monkeypatch.setattr(t, "compile_variant", stub({"viper": 603, "native": 635}))
+    monkeypatch.setattr(t, "resolve_toolchain", lambda *a, **k: ("mpy-cross", []))
+    monkeypatch.setattr(t, "copy_to_board", lambda *a, **k: (_ for _ in ()).throw(
+        OSError(30, "Read-only file system")))
+    a = argparse.Namespace(src="src", out="lib/turbo", arch=None, mpy_cross=None,
+                           offline=True, verbose=False, no_copy=False, port=None,
+                           mount=None, board=None)
+    assert t.cmd_build(a) == 1
+    out = capsys.readouterr().out
+    assert "Read-only file system" in out
+    assert "CircuitPython may have the filesystem for itself" in out
+    assert out.rstrip().endswith("built but not copied")
+    assert "Traceback" not in out
