@@ -8,6 +8,7 @@ bench the candidates on a board, install the winner, keep a manifest.
     turbo_cli.py bench  MODULE --port TTY --mount CIRCUITPY [--out lib/turbo] [--trials N]
     turbo_cli.py check  SRC_DIR [--out lib/turbo]
     turbo_cli.py analyze SRC [--arch A | --board B] [--json]
+    turbo_cli.py verify BASELINE.py CANDIDATE.py --fn NAME [--inputs FILE.py]
     turbo_cli.py pack   PROJECT --board B --firmware FW.uf2 [-o out.uf2]
     turbo_cli.py pack   PROJECT --self-extract [-o code.py]
 
@@ -18,6 +19,7 @@ differs from bytecode. The shim (lib/turbo.py) picks the arch dir at runtime.
 """
 import argparse
 import ast
+import copy
 import glob
 import hashlib
 import json
@@ -29,6 +31,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import types
 import urllib.error
 import urllib.request
 
@@ -1290,6 +1293,200 @@ def cmd_init(a):
 
 
 
+# ---------------------------------------------------------------- verify
+
+# Names the viper compiler knows and CPython does not. Stubbed as int so an
+# annotated signature evaluates on the host; the arithmetic is the same either way
+# except for width, which is the caveat printed under -v.
+VIPER_NAMES = ("ptr8", "ptr16", "ptr32", "uint", "int8", "int16", "int32", "uint8",
+               "uint16", "uint32")
+SEQUENCES = (bytearray, bytes, list, tuple)
+
+
+class VerifyError(Exception):
+    """The harness could not run. Exit 2; a difference in the answer is not this."""
+
+
+class _Identity:
+    """turbo and micropython, as the board sees them once the CLI has done its job:
+    decorators that change nothing."""
+
+    def __call__(self, f):
+        return f
+
+    def native(self, f):
+        return f
+
+    def viper(self, f):
+        return f
+
+    def asm_thumb(self, f):
+        return f
+
+    def const(self, x):
+        return x
+
+
+def load_on_host(path):
+    """Exec a board module on host CPython and return its namespace. The viper type
+    names and the turbo/micropython modules are stubbed for the duration of the exec
+    only, so nothing leaks into the CLI's own builtins."""
+    import builtins
+    if not os.path.isfile(path):
+        raise VerifyError("no such file: %s" % path)
+    stub = _Identity()
+    saved = {n: getattr(builtins, n, None) for n in VIPER_NAMES}
+    injected = [n for n in VIPER_NAMES if not hasattr(builtins, n)]
+    for n in VIPER_NAMES:
+        setattr(builtins, n, int)
+    fake = {"turbo": types.ModuleType("turbo"), "micropython": types.ModuleType("micropython")}
+    fake["turbo"].turbo = stub
+    fake["turbo"].arch = None
+    fake["turbo"].path = "/src"
+    for name in ("native", "viper", "const", "asm_thumb"):
+        setattr(fake["micropython"], name, getattr(stub, name))
+    kept = {k: sys.modules.get(k) for k in fake}
+    sys.modules.update(fake)
+    ns = {"__name__": os.path.basename(path)[:-3], "__file__": path}
+    try:
+        with open(path) as f:
+            code = compile(f.read(), path, "exec")
+        exec(code, ns)
+    except Exception as e:
+        raise VerifyError("%s did not run on the host: %s: %s"
+                          % (path, type(e).__name__, e))
+    finally:
+        for n in injected:
+            delattr(builtins, n)
+        for n, v in saved.items():
+            if v is not None:
+                setattr(builtins, n, v)
+        for k, v in kept.items():
+            if v is None:
+                sys.modules.pop(k, None)
+            else:
+                sys.modules[k] = v
+    return ns
+
+
+def compare_values(a, b):
+    """(same, shown_a, shown_b, summary) for one pair of results. Sequences of
+    numbers are compared element-wise; everything else by equality."""
+    if isinstance(a, SEQUENCES) and isinstance(b, SEQUENCES) and len(a) == len(b) \
+            and all(isinstance(x, int) for x in a) and all(isinstance(x, int) for x in b):
+        deltas = [abs(x - y) for x, y in zip(a, b)]
+        differ = sum(1 for d in deltas if d)
+        shown_a, shown_b = str(sum(a)), str(sum(b))
+        if not differ:
+            return True, shown_a, shown_b, "identical, %s values" % thousands(len(a))
+        return False, shown_a, shown_b, "%s of %s differ, max %d, mean %.2f" % (
+            thousands(differ), thousands(len(a)), max(deltas), sum(deltas) / float(len(deltas)))
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)) and not isinstance(a, bool):
+        if a == b:
+            return True, str(a), str(b), "identical"
+        d = b - a
+        pct = " (%.2f%%)" % (100.0 * abs(d) / abs(a)) if a else ""
+        return False, str(a), str(b), "delta %+d%s" % (d, pct) if isinstance(d, int) \
+            else "delta %+g%s" % (d, pct)
+    same = a == b
+    return same, repr(a)[:40], repr(b)[:40], "identical" if same else "differ"
+
+
+def merge_slot(acc, a, b):
+    """Fold one case's pair of results into a running per-slot comparison."""
+    if isinstance(a, SEQUENCES) and isinstance(b, SEQUENCES):
+        acc[0].extend(a)
+        acc[1].extend(b)
+    else:
+        acc[0].append(a)
+        acc[1].append(b)
+    return acc
+
+
+def run_cases(ns_a, ns_b, fn_name, cases):
+    """Call fn_name in both namespaces on every case. Returns (description, rows),
+    where a row is (label, same, a, b, summary). Each side gets its own copy of the
+    arguments, so a function that writes into a buffer is compared by that buffer."""
+    for ns, which in ((ns_a, "baseline"), (ns_b, "candidate")):
+        if not callable(ns.get(fn_name)):
+            raise VerifyError("%s has no function %s()" % (which, fn_name))
+    # Label a mutated argument with its parameter name. Read from the code object,
+    # not inspect.signature: on Python 3.14 annotations are evaluated lazily, so
+    # touching them here would re-raise NameError on ptr8 outside the stub window.
+    code = getattr(ns_b[fn_name], "__code__", None)
+    names = list(code.co_varnames[:code.co_argcount]) if code else []
+    description, slots, n = None, {}, 0
+    for i, case in enumerate(cases):
+        if i == 0 and isinstance(case, str):
+            description = case
+            continue
+        args = case if isinstance(case, tuple) else (case,)
+        out = []
+        for ns in (ns_a, ns_b):
+            call_args = copy.deepcopy(args)
+            try:
+                ret = ns[fn_name](*call_args)
+            except Exception as e:
+                raise VerifyError("%s(%s) raised on the host: %s: %s"
+                                  % (fn_name, "case %d" % i, type(e).__name__, e))
+            out.append((ret, call_args))
+        n += 1
+        (ret_a, args_a), (ret_b, args_b) = out
+        if ret_a is not None or ret_b is not None:
+            merge_slot(slots.setdefault("return", ([], [])), ret_a, ret_b)
+        for j, (before, after_a, after_b) in enumerate(zip(args, args_a, args_b)):
+            if after_a != before or after_b != before:  # the function wrote into it
+                label = names[j] if j < len(names) else "arg %d" % j
+                merge_slot(slots.setdefault(label, ([], [])), after_a, after_b)
+    if not n:
+        raise VerifyError("cases() yielded nothing to run")
+    rows = []
+    for label, (a, b) in slots.items():
+        same, sa, sb, summary = compare_values(a, b)
+        rows.append((label, same, sa, sb, summary))
+    return description, rows
+
+
+def cmd_verify(a):
+    try:
+        base = load_on_host(a.baseline)
+        cand = load_on_host(a.candidate)
+        if a.inputs:
+            harness = load_on_host(a.inputs)
+            if not callable(harness.get("cases")):
+                raise VerifyError("%s defines no cases()" % a.inputs)
+            if not a.fn:
+                raise VerifyError("--inputs needs --fn NAME: which function to call")
+            description, rows = run_cases(base, cand, a.fn, harness["cases"]())
+        elif callable(base.get("_turbo_bench")) and callable(cand.get("_turbo_bench")):
+            description = None
+            same, sa, sb, summary = compare_values(base["_turbo_bench"](),
+                                                   cand["_turbo_bench"]())
+            rows = [("checksum", same, sa, sb, summary)]
+        else:
+            raise VerifyError("no inputs: pass --inputs, or define _turbo_bench() "
+                              "in both modules")
+    except VerifyError as e:
+        print(e)
+        return 2
+
+    if description:
+        print(description)
+    for label, _, sa, sb, summary in rows:
+        print("  %-9s  %s -> %s        %s" % (label, sa, sb, summary))
+    if all(same for _, same, _, _, _ in rows):
+        print("  identical output")
+    else:
+        print("  fixed point moved the answer. this is the number a reviewer wants to see.")
+    if a.verbose:
+        if a.fn and not a.inputs:
+            print("  --fn is unused without --inputs; _turbo_bench() was compared instead")
+        print("  host ints are unbounded; viper ints wrap at 32 bits, so a host match is")
+        print("  necessary, not sufficient. turbo bench on a board is the final word.")
+    return 0
+
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1303,7 +1500,7 @@ def main():
     d.add_argument("--offline", action="store_true", help="never fetch")
     d.add_argument("--json", action="store_true")
     d.add_argument("-v", "--verbose", action="store_true")
-    d.set_defaults(fn=cmd_doctor)
+    d.set_defaults(run=cmd_doctor)
     i = sub.add_parser("init", help="create lib/turbo.py, src/ and lib/turbo/<arch>/")
     i.add_argument("--port")
     i.add_argument("--mount")
@@ -1313,7 +1510,7 @@ def main():
     i.add_argument("--src", default="src")
     i.add_argument("--example", action="store_true",
                    help="also write the mandelbrot src/pixels.py and code.py")
-    i.set_defaults(fn=cmd_init, mpy_cross=None, offline=True, json=False, verbose=False)
+    i.set_defaults(run=cmd_init, mpy_cross=None, offline=True, json=False, verbose=False)
     b = sub.add_parser("build", help="compile the @turbo modules in SRC for this board")
     b.add_argument("src", nargs="?", default="src")
     b.add_argument("--out", default="lib/turbo")
@@ -1326,7 +1523,7 @@ def main():
                    help="do not copy the result to the CIRCUITPY drive")
     b.add_argument("--offline", action="store_true", help="never fetch mpy-cross")
     b.add_argument("-v", "--verbose", action="store_true")
-    b.set_defaults(fn=cmd_build)
+    b.set_defaults(run=cmd_build)
     n = sub.add_parser("bench")
     n.add_argument("module")
     n.add_argument("--port", required=True)
@@ -1336,11 +1533,11 @@ def main():
     n.add_argument("--min-gain", type=float, default=1.05,
                    help="a compiled tier must beat the bytecode median by this factor (default 1.05)")
     n.add_argument("--pyboard-tools", default=os.path.expanduser("~/cp-1030/tools"))
-    n.set_defaults(fn=cmd_bench)
+    n.set_defaults(run=cmd_bench)
     c = sub.add_parser("check")
     c.add_argument("src")
     c.add_argument("--out", default="lib/turbo")
-    c.set_defaults(fn=cmd_check)
+    c.set_defaults(run=cmd_check)
     k = sub.add_parser("pack", help="one UF2: turbo firmware + project files (or a self-extracting code.py)")
     k.add_argument("project", help="folder with code.py, lib/, src/")
     k.add_argument("--board", help="folder2uf2 board name, e.g. adafruit_metro_rp2350")
@@ -1350,15 +1547,23 @@ def main():
                    help="emit a self-extracting code.py instead; works on any port, no firmware included")
     k.add_argument("--force", action="store_true", help="pack even if a compiled module is stale")
     k.add_argument("--folder2uf2", default="folder2uf2")
-    k.set_defaults(fn=cmd_pack)
+    k.set_defaults(run=cmd_pack)
+    y = sub.add_parser("verify", help="run two versions on host CPython and compare")
+    y.add_argument("baseline", help="the version you trust, e.g. the float original")
+    y.add_argument("candidate", help="the rewrite, e.g. the fixed-point version")
+    y.add_argument("--fn", help="function to call with each case from --inputs")
+    y.add_argument("--inputs", help="a .py file defining cases(); default is "
+                                    "_turbo_bench() in both modules")
+    y.add_argument("-v", "--verbose", action="store_true")
+    y.set_defaults(run=cmd_verify)
     z = sub.add_parser("analyze", help="static guess at which functions turbo can speed up")
     z.add_argument("src", help="a .py file or a project folder")
     z.add_argument("--arch", help="target arch, e.g. armv7emsp")
     z.add_argument("--board", help="board id, resolves to an arch")
     z.add_argument("--json", action="store_true")
-    z.set_defaults(fn=cmd_analyze)
+    z.set_defaults(run=cmd_analyze)
     a = p.parse_args()
-    sys.exit(a.fn(a) or 0)
+    sys.exit(a.run(a) or 0)
 
 
 if __name__ == "__main__":

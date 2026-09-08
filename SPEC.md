@@ -346,11 +346,17 @@ New. Runs both files on **host CPython** and compares. Purpose: show how far a
 fixed-point rewrite moved the answer. No board, no `mpy-cross`.
 
 ```
-$ turbo verify src/mandel_float.py src/pixels.py --fn mandel_row
-240 rows x 320 px, both versions run on the host
-  checksum   581 -> 576        max per-pixel delta 1 of 64 iterations
+$ turbo verify src/mandel_float.py src/pixels.py --fn mandel_row --inputs cases.py
+120 rows x 160 px, 64 iterations, both versions run on the host
+  out        407790 -> 407644        335 of 19,200 differ, max 42, mean 0.09
   fixed point moved the answer. this is the number a reviewer wants to see.
 ```
+
+Measured on the host 2026-09-07, not invented: the float loop checksums 407790,
+the 12-bit fixed-point loop 407644, and 335 of the 19,200 pixels land on a
+different iteration count. Without `--inputs` the same pair is compared through
+`_turbo_bench()` and prints one `checksum` row. The earlier draft of this spec
+said `581 -> 576`; those numbers were never run.
 
 Mechanics:
 
@@ -548,9 +554,9 @@ Unit (pytest, no hardware):
 - URL builder: the five platform keys produce the exact paths in 2.1.
 - `rewrite()`: existing behavior, both tiers, no-decorator returns `None`.
 - Hint lookup: each error prefix in section 6 maps to its hint.
-- `verify`: the mandelbrot float vs fixed-point pair reports `581 -> 576`
-  (the checksum of the 160x120 grid; confirm against `_turbo_bench()` on the
-  host first and correct the doc if the host number differs).
+- `verify`: the mandelbrot float vs fixed-point pair reports `407790 -> 407644`
+  (the checksum of the 160x120 grid, confirmed against `_turbo_bench()` on the
+  host 2026-09-07).
 
 Integration (farm, `bravo`; see the `hil-farm` skill and
 `adafruit-turbo/tools/farm/deploy-test.sh`):
