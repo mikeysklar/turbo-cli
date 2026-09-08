@@ -109,3 +109,41 @@ def test_project_line_counts_modules_and_stale(tmp_path, monkeypatch):
     (tmp_path / "src" / "pixels.py").write_text("x = 2\n")
     assert t.project_state(str(out), "xtensawin") == (1, 1)
     assert t.project_state(str(out), "armv6m") is None
+
+
+BUSY = "[Errno 16] could not open port /dev/cu.usbmodem1301: Resource busy"
+
+
+@pytest.mark.parametrize("errors, want", [
+    ([("/dev/cu.usbmodem1301", BUSY)], [("/dev/cu.usbmodem1301", "busy")]),
+    ([("/dev/ttyACM0", "[Errno 13] Permission denied: '/dev/ttyACM0'")],
+     [("/dev/ttyACM0", "not readable by this user")]),
+    ([("COM4", "Access is denied.")], [("COM4", "not readable by this user")]),
+    ([("/dev/cu.x", "no raw REPL banner within the timeout")], []),
+    ([(None, "pyserial is not installed")], []),
+])
+def test_busy_ports(errors, want):
+    assert t.busy_ports(errors) == want
+
+
+def test_a_held_port_is_not_the_same_as_no_port(tmp_path):
+    f = facts(port=None, mpy=None, abi=None, arch="armv6m", arch_source="board_id",
+              port_errors=[("/dev/cu.usbmodem1301", BUSY)])
+    lines, _ = t.doctor_lines(f, offline=True, src=str(tmp_path / "none"))
+    assert ("_mpy        /dev/cu.usbmodem1301 is busy; arch from board id: armv6m "
+            "(loader presence unknown)") in lines
+    assert "   Another program has the REPL open (Mu, Thonny, screen, a browser web" in lines
+    assert not any("no serial port found" in l for l in lines)
+
+
+def test_a_held_port_with_no_drive_says_so_first(tmp_path):
+    f = facts(mount=None, mounts=0, port=None, mpy=None, abi=None, arch=None,
+              arch_source=None, boot={}, port_errors=[("/dev/cu.usbmodem1301", BUSY)])
+    lines, ready = t.doctor_lines(f, offline=True, src=str(tmp_path / "none"))
+    assert not ready
+    assert lines[0] == "port /dev/cu.usbmodem1301   busy, another program has it open"
+    assert not any("no board found" in l for l in lines)
+
+
+def test_the_board_table_knows_the_feather_rp2040():
+    assert t.BOARD_ARCH["adafruit_feather_rp2040"] == "armv6m"

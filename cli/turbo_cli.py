@@ -634,6 +634,7 @@ MEASURED = {
 BOARD_ARCH = {
     "metro_m0_express": "armv6m",
     "adafruit_metro_rp2040": "armv6m",
+    "adafruit_feather_rp2040": "armv6m",
     "metro_m4_airlift_lite": "armv7emsp",
     "adafruit_metro_rp2350": "armv7emsp",
     "adafruit_feather_nrf52840_express": "armv7emsp",
@@ -1148,6 +1149,22 @@ def board_facts(a):
     return f
 
 
+def busy_ports(errors):
+    """Ports that exist but would not open, with why. Another program holding the
+    REPL is the single most common reason turbo cannot read _mpy, and it is not the
+    same as no port at all."""
+    out = []
+    for port, err in errors:
+        low = (err or "").lower()
+        if not port:
+            continue
+        if "busy" in low:
+            out.append((port, "busy"))
+        elif "permission denied" in low or "access is denied" in low:
+            out.append((port, "not readable by this user"))
+    return out
+
+
 def doctor_lines(f, mpy_cross=None, offline=False, out="lib/turbo", src="src", echo=None):
     """(lines, ready). ready is "could a build run right now" and drives the exit
     status. Wording and column widths are SPEC.md 5.1 and 6. `echo` prints each line
@@ -1164,7 +1181,14 @@ def doctor_lines(f, mpy_cross=None, offline=False, out="lib/turbo", src="src", e
         add("%-*s%s" % (L, label, value))
 
     boot = f["boot"]
-    if not f["mount"] and not f["port"]:
+    busy = busy_ports(f["port_errors"])
+    if not f["mount"] and not f["port"] and busy:
+        add("port %s   %s, another program has it open" % (busy[0][0], busy[0][1]),
+            "   Close the serial monitor (Mu, Thonny, screen, a browser web workflow",
+            "   page) and run turbo doctor again.")
+        if not f["arch"]:
+            return lines, False
+    elif not f["mount"] and not f["port"]:
         add("no board found",
             "   No CIRCUITPY drive and no serial port. Plug the board in, or pass",
             "   --mount DIR and --port TTY, or --arch NAME to build without a board.")
@@ -1195,6 +1219,11 @@ def doctor_lines(f, mpy_cross=None, offline=False, out="lib/turbo", src="src", e
         return lines, False
     elif f["arch_source"] == "flag":
         row("_mpy", "not read; --arch %s given (loader presence unknown)" % f["arch"])
+    elif busy:
+        row("_mpy", "%s is %s; arch from board id: %s (loader presence unknown)"
+            % (busy[0][0], busy[0][1], f["arch"] or "unknown"))
+        add("   Another program has the REPL open (Mu, Thonny, screen, a browser web",
+            "   workflow page). Close it so turbo can read _mpy and confirm the loader.")
     elif f["mount"]:
         row("_mpy", "no serial port found; arch from board id: %s (loader presence unknown)"
             % (f["arch"] or "unknown"))
