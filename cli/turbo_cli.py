@@ -471,10 +471,13 @@ MEASURED = {
     "xtensawin": {"viper": 26.2, "native": 2.85, "board": "Metro ESP32-S3"},
 }
 BOARD_ARCH = {
+    "metro_m0_express": "armv6m",
     "adafruit_metro_rp2040": "armv6m",
+    "metro_m4_airlift_lite": "armv7emsp",
     "adafruit_metro_rp2350": "armv7emsp",
     "adafruit_feather_nrf52840_express": "armv7emsp",
     "adafruit_feather_stm32f405_express": "armv7emsp",
+    "adafruit_metro_esp32s2": "xtensawin",
     "adafruit_metro_esp32s3": "xtensawin",
 }
 
@@ -756,9 +759,218 @@ def cmd_analyze(a):
 
 
 
+# ---------------------------------------------------------------- doctor
+
+L = 12  # label column
+
+
+def cache_root():
+    return os.environ.get("TURBO_CACHE") or os.path.join(os.path.expanduser("~"),
+                                                         ".cache", "turbo")
+
+
+def is_release_version(version):
+    """Adafruit publishes mpy-cross per release only, so a version string that is not
+    exactly N.N.N (beta, rc, or a -N-ghash[-dirty] dev build) has no binary to fetch."""
+    return bool(version and re.match(r"^\d+\.\d+\.\d+$", version))
+
+
+def cached_mpy_cross(version, key):
+    """Path to the cached official mpy-cross for this version and host, or None."""
+    if not version or not key:
+        return None
+    p = os.path.join(cache_root(), "mpy-cross", version, key,
+                     "mpy-cross.exe" if key == "windows" else "mpy-cross")
+    return p if os.path.isfile(p) else None
+
+
+def mpy_cross_abi(path):
+    """(CircuitPython version, mpy abi) an mpy-cross binary reports, or (None, None).
+    It prints e.g. "CircuitPython 10.3.0 on 2026-08-31; mpy-cross emitting mpy v6.3"."""
+    try:
+        r = subprocess.run([path, "--version"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None, None
+    m = re.search(r"CircuitPython (\S+).*?mpy v(\d+\.\d+)", r.stdout + r.stderr, re.S)
+    return (m.group(1), m.group(2)) if m else (None, None)
+
+
+def project_state(out, arch, src="src"):
+    """(module count, stale count) for `arch` in the manifest, or None with no project."""
+    if not os.path.isdir(src) or not arch:
+        return None
+    manifest = load_manifest(out)
+    n = stale = 0
+    for name, entry in manifest.items():
+        if not isinstance(entry.get(arch), dict):
+            continue
+        n += 1
+        path = entry.get("src", "")
+        if not os.path.isfile(path) or sha256(path) != entry.get("sha256"):
+            stale += 1
+    return (n, stale) if n else None
+
+
+def board_facts(a):
+    """Everything doctor reports, gathered once. Never raises: an unreachable board
+    is a fact, not an error. arch_source says how much to trust `arch`."""
+    f = {"mount": None, "mounts": 0, "boot": {}, "port": None, "port_errors": [],
+         "mpy": None, "arch": None, "abi": None, "arch_source": None}
+    mounts = find_mounts(getattr(a, "mount", None), getattr(a, "board", None))
+    f["mounts"] = len(mounts)
+    if mounts:
+        f["mount"], f["boot"] = mounts[0]
+    try:
+        import turbo_repl
+        ports = turbo_repl.find_ports(getattr(a, "port", None), f["boot"].get("uid"))
+        port, mpy, version, errs = turbo_repl.probe_any(ports)
+        f["port"], f["port_errors"] = port, errs
+        if port is not None:
+            f["mpy"] = mpy
+            d = decode_mpy(mpy)
+            f["arch"], f["abi"], f["arch_source"] = d["arch"], d["abi"], "probe"
+            f["boot"].setdefault("version", version)
+    except Exception as e:  # no pyserial, or the port vanished mid-probe
+        f["port_errors"].append((None, str(e)))
+    if f["arch_source"] is None and f["boot"].get("board_id"):
+        f["arch"] = BOARD_ARCH.get(f["boot"]["board_id"])
+        f["arch_source"] = "board_id" if f["arch"] else None
+    if getattr(a, "arch", None):
+        f["arch"], f["arch_source"] = a.arch, "flag"
+    return f
+
+
+def doctor_lines(f, mpy_cross=None, offline=False, out="lib/turbo", src="src"):
+    """(lines, ready). ready is "could a build run right now" and drives the exit
+    status. Wording and column widths are SPEC.md 5.1 and 6."""
+    def row(label, value):
+        lines.append("%-*s%s" % (L, label, value))
+
+    lines, ready = [], False
+    boot = f["boot"]
+    if not f["mount"] and not f["port"]:
+        lines.append("no board found")
+        lines.append("   No CIRCUITPY drive and no serial port. Plug the board in, or pass")
+        lines.append("   --mount DIR and --port TTY, or --arch NAME to build without a board.")
+        if not f["arch"]:
+            return lines, False
+
+    if boot.get("board_name") or boot.get("board_id"):
+        row("board", "%-30s%s" % (boot.get("board_name") or "?", boot.get("board_id") or ""))
+    if f["port"]:
+        row("port", f["port"])
+    if f["mount"]:
+        row("drive", f["mount"] + ("  (%d found, using the first; pass --mount)" % f["mounts"]
+                                   if f["mounts"] > 1 else ""))
+    version = boot.get("version")
+    if version:
+        row("firmware", "CircuitPython " + version)
+
+    if f["mpy"] is not None and f["arch"]:
+        row("_mpy", "0x%04x   arch %s \u00b7 mpy %s \u00b7 native loader present"
+            % (f["mpy"], f["arch"], f["abi"]))
+    elif f["mpy"] is not None:
+        row("_mpy", "0x%04x   arch 0, no native loader" % f["mpy"])
+        lines.append("   This board runs stock CircuitPython %s. Compiled modules will not"
+                     % (version or "?"))
+        lines.append("   load. Your code still runs from /src as bytecode.")
+        lines.append("   Flash turbo firmware for %s (see docs/build.md)."
+                     % (boot.get("board_id") or "this board"))
+        return lines, False
+    elif f["arch_source"] == "flag":
+        row("_mpy", "not read; --arch %s given (loader presence unknown)" % f["arch"])
+    elif f["mount"]:
+        row("_mpy", "no serial port found; arch from board id: %s (loader presence unknown)"
+            % (f["arch"] or "unknown"))
+
+    if not f["arch"]:
+        lines.append("no arch")
+        lines.append("   Board id %s is not in the table and no port answered."
+                     % (boot.get("board_id") or "?"))
+        lines.append("   Pass --arch NAME (%s)." % ", ".join(sorted(ARCH_ID)))
+        return lines, False
+
+    key = platform_key()
+    if mpy_cross:
+        cp_version, abi = mpy_cross_abi(mpy_cross)
+        row("toolchain", "%s   %s" % (mpy_cross,
+                                      "mpy v%s" % abi if abi else "--version unreadable"))
+        ready = True
+    elif key is None:
+        lines.append("host %s %s   Adafruit builds macOS arm64 only"
+                     % (platform.system(), platform.machine()))
+        lines.append("   Rosetta (arch -arm64 is not available on Intel), or a local build:")
+        lines.append("   make -C mpy-cross in a CircuitPython checkout, then --mpy-cross PATH.")
+    elif not version:
+        row("toolchain", "no firmware version; cannot pick an mpy-cross")
+    elif not is_release_version(version):
+        lines.append("firmware %s   no published mpy-cross for that version" % version)
+        lines.append("   Adafruit publishes mpy-cross per release only. Use a release build,")
+        lines.append("   or point turbo at a local mpy-cross with --mpy-cross PATH.")
+    else:
+        cached = cached_mpy_cross(version, key)
+        if cached:
+            cp_version, abi = mpy_cross_abi(cached)
+            if abi and f["abi"] and abi != f["abi"]:
+                lines.append("mpy-cross %s reports mpy v%s, board wants v%s; refusing to use it"
+                             % (version, abi, f["abi"]))
+            else:
+                row("toolchain", "%s   %d KB   mpy v%s"  # KB = 1000, as in SPEC 5.1
+                    % (cached, os.path.getsize(cached) // 1000, abi or "?"))
+                ready = True
+        else:
+            row("toolchain", "not cached  %s  %s" % (key, version))
+            lines.append(" " * L + mpy_cross_url(version, key))
+
+    p = project_state(out, f["arch"], src)
+    if p:
+        row("project", "%s/  %d module%s, %s" % (os.path.join(out, f["arch"]), p[0],
+                                                 "" if p[0] == 1 else "s",
+                                                 "fresh" if not p[1] else "%d stale" % p[1]))
+    if ready:
+        row("ready", "turbo build compiles -march=%s" % f["arch"])
+    else:
+        row("not ready", "no mpy-cross for CircuitPython %s on this host; pass --mpy-cross PATH"
+            % (version or "?"))
+
+    return lines, ready
+
+
+def cmd_doctor(a):
+    f = board_facts(a)
+    lines, ready = doctor_lines(f, a.mpy_cross, a.offline, a.out)
+    if a.json:
+        print(json.dumps({"board": f["boot"].get("board_id"),
+                          "board_name": f["boot"].get("board_name"),
+                          "port": f["port"], "drive": f["mount"],
+                          "firmware": f["boot"].get("version"), "mpy": f["mpy"],
+                          "arch": f["arch"], "arch_source": f["arch_source"],
+                          "mpy_abi": f["abi"], "mpy_cross": a.mpy_cross or cached_mpy_cross(
+                              f["boot"].get("version"), platform_key()),
+                          "ready": ready}, indent=2, sort_keys=True))
+    else:
+        print("\n".join(lines))
+        if a.verbose:
+            for port, err in f["port_errors"]:
+                print("%-*s%s%s" % (L, "", "%s: " % port if port else "", err))
+    return 0 if ready else 1
+
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+    d = sub.add_parser("doctor", help="board, firmware, arch and toolchain in one screen")
+    d.add_argument("--port", help="serial port; autodetected when absent")
+    d.add_argument("--mount", help="CIRCUITPY drive; autodetected when absent")
+    d.add_argument("--board", help="board id, to pick between two drives")
+    d.add_argument("--arch", help="assume this arch instead of asking the board")
+    d.add_argument("--mpy-cross", help="use this mpy-cross instead of the cached one")
+    d.add_argument("--out", default="lib/turbo")
+    d.add_argument("--offline", action="store_true", help="never fetch")
+    d.add_argument("--json", action="store_true")
+    d.add_argument("-v", "--verbose", action="store_true")
+    d.set_defaults(fn=cmd_doctor)
     b = sub.add_parser("build")
     b.add_argument("src")
     b.add_argument("--out", default="lib/turbo")
