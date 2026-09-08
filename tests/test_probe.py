@@ -23,7 +23,8 @@ def test_decode_mpy(mpy, arch):
 
 def test_decode_mpy_matches_shim_table():
     # 2.2: the CLI table and shim/turbo.py _ARCH must agree
-    src = open(os.path.join(os.path.dirname(__file__), "..", "shim", "turbo.py")).read()
+    src = open(os.path.join(os.path.dirname(__file__), "..", "cli", "turbo_assets", "shim",
+                          "turbo.py")).read()
     ns = {}
     exec(src.split("arch = ")[0], ns)  # imports plus the _ARCH table only
     assert ns["_ARCH"] == t.ARCH_NAME

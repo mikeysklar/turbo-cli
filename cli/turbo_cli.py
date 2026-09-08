@@ -2,6 +2,8 @@
 """turbo_cli: compile @turbo-decorated CircuitPython modules to native .mpy,
 bench the candidates on a board, install the winner, keep a manifest.
 
+    turbo_cli.py doctor [--port TTY] [--mount DIR] [--arch A] [--mpy-cross PATH]
+    turbo_cli.py init   [--arch A] [--example]
     turbo_cli.py build  SRC_DIR [--out lib/turbo] [--mpy-cross PATH] [--arch a,b]
     turbo_cli.py bench  MODULE --port TTY --mount CIRCUITPY [--out lib/turbo] [--trials N]
     turbo_cli.py check  SRC_DIR [--out lib/turbo]
@@ -1064,6 +1066,74 @@ def cmd_doctor(a):
 
 
 
+# ---------------------------------------------------------------- init
+
+def asset(*parts):
+    """A bundled file (shim, examples), or None. Works from a checkout and from an
+    installed wheel, where turbo_assets is package data next to this module."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for base in (os.path.join(here, "turbo_assets"), os.path.join(here, "..")):
+        path = os.path.normpath(os.path.join(base, *parts))
+        if os.path.exists(path):
+            return path
+    return None
+
+
+def cmd_init(a):
+    """Create the on-board layout for this arch. Idempotent: an existing file is
+    reported and left alone, never overwritten (SPEC 5.2)."""
+    f = board_facts(a)
+    arch = f["arch"]
+    if not arch:
+        doctor_lines(f, offline=True, out=a.out, src=a.src, echo=print)
+        return 1
+
+    def report(verb, path, note):
+        print("%-7s%-26s%s" % (verb, path, note))
+
+    def make_dir(path, note):
+        exists = os.path.isdir(path)
+        if not exists:
+            os.makedirs(path)
+        report("kept" if exists else "made", path.rstrip("/\\") + "/", note)
+
+    def copy(src, dest, note, kept_note=None):
+        if os.path.exists(dest):
+            report("kept", dest, kept_note or note)
+            return False
+        d = os.path.dirname(dest)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        shutil.copyfile(src, dest)
+        report("wrote", dest, note)
+        return True
+
+    shim = asset("shim", "turbo.py")
+    if not shim:
+        print("bundled shim not found")
+        print("   turbo_assets/shim/turbo.py is missing from this install.")
+        print("   Copy shim/turbo.py from the turbo repo to lib/turbo.py yourself.")
+        return 1
+    n = len(open(shim).read().splitlines())
+    copy(shim, os.path.join("lib", "turbo.py"),
+         "shim, %d lines, identity decorators on stock firmware" % n)
+    make_dir(a.src, "your source, kept off sys.path so it never shadows .mpy")
+    make_dir(os.path.join(a.out, arch), "where compiled modules land")
+
+    if a.example:
+        ex = asset("examples", "mandelbrot")
+        if not ex:
+            print("bundled example not found; see examples/mandelbrot in the repo")
+            return 1
+        copy(os.path.join(ex, "src", "pixels.py"), os.path.join(a.src, "pixels.py"),
+             "mandelbrot, 12-bit fixed point, @turbo.viper")
+        copy(os.path.join(ex, "code.py"), "code.py",
+             "imports turbo, then pixels; prints the checksum",
+             kept_note="not overwritten; see examples/mandelbrot/code.py")
+    return 0
+
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -1078,6 +1148,16 @@ def main():
     d.add_argument("--json", action="store_true")
     d.add_argument("-v", "--verbose", action="store_true")
     d.set_defaults(fn=cmd_doctor)
+    i = sub.add_parser("init", help="create lib/turbo.py, src/ and lib/turbo/<arch>/")
+    i.add_argument("--port")
+    i.add_argument("--mount")
+    i.add_argument("--board")
+    i.add_argument("--arch", help="layout for this arch instead of asking the board")
+    i.add_argument("--out", default="lib/turbo")
+    i.add_argument("--src", default="src")
+    i.add_argument("--example", action="store_true",
+                   help="also write the mandelbrot src/pixels.py and code.py")
+    i.set_defaults(fn=cmd_init, mpy_cross=None, offline=True, json=False, verbose=False)
     b = sub.add_parser("build")
     b.add_argument("src")
     b.add_argument("--out", default="lib/turbo")
