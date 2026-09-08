@@ -1307,7 +1307,7 @@ def doctor_lines(f, mpy_cross=None, offline=False, out="lib/turbo", src="src", e
         add("   This board runs stock CircuitPython %s. Compiled modules will not"
             % (version or "?"),
             "   load. Your code still runs from /src as bytecode.",
-            "   Flash turbo firmware for %s (see docs/build.md)."
+            "   Flash turbo firmware for %s: README, \"Firmware the board needs\"."
             % (boot.get("board_id") or "this board"))
         return lines, False
     elif f["arch_source"] == "flag":

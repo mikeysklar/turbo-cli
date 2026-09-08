@@ -501,7 +501,7 @@ Print the first line, then the explanation and fix indented three spaces.
 _mpy 0x0306   arch 0, no native loader
    This board runs stock CircuitPython 10.3.0. Compiled modules will not
    load. Your code still runs from /src as bytecode.
-   Flash turbo firmware for adafruit_metro_esp32s3 (see docs/build.md).
+   Flash turbo firmware for adafruit_metro_esp32s3: README, "Firmware the board needs".
 
 lib/turbo/armv7emsp/   present, but this board is xtensawin
    Built for a different board.   turbo build --arch xtensawin

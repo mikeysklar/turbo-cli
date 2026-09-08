@@ -49,7 +49,8 @@ def test_stock_firmware_is_arch_zero(tmp_path):
     assert not ready
     assert "_mpy        0x0306   arch 0, no native loader" in lines
     assert lines[-3].startswith("   This board runs stock CircuitPython 10.3.0.")
-    assert lines[-1] == "   Flash turbo firmware for adafruit_metro_esp32s3 (see docs/build.md)."
+    assert lines[-1] == ("   Flash turbo firmware for adafruit_metro_esp32s3:"
+                         ' README, "Firmware the board needs".')
 
 
 def test_no_board_at_all(tmp_path):
