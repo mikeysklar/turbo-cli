@@ -32,7 +32,6 @@ import time
 import urllib.error
 import urllib.request
 
-ARCHES = ["armv6m", "armv7emsp"]
 ARCH_ID = {"armv6m": 4, "armv7m": 5, "armv7em": 6, "armv7emsp": 7, "armv7emdp": 8,
            "xtensa": 9, "xtensawin": 10, "rv32imc": 11}
 DECO = re.compile(r"^(\s*)@turbo(\.native|\.viper)?\s*$")
@@ -197,8 +196,48 @@ def compile_variant(mpy_cross, text, name, arch, dest):
         r = subprocess.run([mpy_cross, "-march=" + arch, src, "-o", dest],
                            capture_output=True, text=True)
     if r.returncode:
-        return r.stderr.strip().splitlines()[-1] if r.stderr.strip() else "mpy-cross failed"
+        # the whole thing: build wants the `File "...", line N` line too (SPEC 4.2)
+        return r.stderr.strip() or "mpy-cross failed"
     return None
+
+
+# Hints for the compiler's own errors, SPEC 6. Keyed by prefix because the text
+# carries a variable name. No match prints nothing; a wrong hint is worse than none.
+HINTS = [
+    ("ViperTypeError: can't do binary op",
+     ["a float reached a viper function; scale to integers"]),
+    ("ViperTypeError: local",
+     ["a value came from a Python object; declare the parameter type",
+      "(out: ptr8, n: int) or convert with int()"]),
+    ("SyntaxError: invalid micropython decorator",
+     ["this firmware has no emitter; the decorator must go through turbo build,",
+      "not run from source"]),
+    ("ValueError: incompatible .mpy arch",
+     ["(seen on the board) the .mpy is for a different arch; turbo doctor"]),
+    ("ValueError: native code in .mpy unsupported",
+     ["(seen on the board) stock firmware; see the arch 0 sentence above"]),
+]
+
+
+def hint_for(message):
+    for prefix, lines in HINTS:
+        if message.startswith(prefix):
+            return lines
+    return []
+
+
+def compiler_error(stderr, src_path):
+    """(location, message, hint) from mpy-cross stderr. The rewritten source has the
+    same line numbering as the original, so the traceback's line number is the user's."""
+    lines = [l for l in (stderr or "").strip().splitlines() if l.strip()]
+    message = lines[-1] if lines else "mpy-cross failed"
+    line_no = None
+    for l in lines:
+        m = re.search(r'File "[^"]*", line (\d+)', l)
+        if m:
+            line_no = int(m.group(1))
+    return ("%s:%d" % (src_path, line_no) if line_no else src_path), message, hint_for(message)
+
 
 
 def load_manifest(out):
@@ -216,63 +255,159 @@ def save_manifest(out, m):
         f.write("\n")
 
 
+def thousands(n):
+    return format(n, ",d")
+
+
+def build_module(mpy_cross, name, path, text, archs, out, echo=print):
+    """Compile one module for every arch. Prints the report lines (SPEC 5.3) and
+    returns (manifest entry fields, installed paths, ok). ok is False when some arch
+    ended with nothing installable, which is what makes build exit 1."""
+    entry, installed, ok = {}, [], True
+    label = name
+    for arch in archs:
+        d = os.path.join(out, arch)
+        os.makedirs(d, exist_ok=True)
+        sizes, errors, candidates = {}, {}, {}
+        for tier in ("viper", "native"):
+            dest = os.path.join(d, "%s.%s.mpy" % (name, tier))
+            err = compile_variant(mpy_cross, rewrite(text, tier), name, arch, dest)
+            if err:
+                errors[tier] = err
+                candidates[tier] = "failed: " + err.strip().splitlines()[-1]
+                if os.path.exists(dest):
+                    os.remove(dest)
+            else:
+                sizes[tier] = candidates[tier] = os.path.getsize(dest)
+        # install viper if it compiled, else native (existing rule)
+        pick = "viper" if "viper" in sizes else "native" if "native" in sizes else None
+        arch_entry = {"candidates": candidates, "installed": pick, "measured": False}
+        installed_path = os.path.join(d, name + ".mpy")
+        if pick:
+            shutil.copyfile(os.path.join(d, "%s.%s.mpy" % (name, pick)), installed_path)
+            installed.append((arch, installed_path))
+        elif os.path.exists(installed_path):
+            # never let an old binary stand in for source that no longer compiles
+            os.remove(installed_path)
+        entry[arch] = arch_entry
+
+        if "viper" in errors:
+            loc, message, hint = compiler_error(errors["viper"], path)
+            echo("%-11s%-8s%s" % (label, "FAILED", loc))
+            echo(" " * 11 + message)
+            for h in hint:
+                echo(" " * 11 + h)
+            if "native" in sizes:  # the module still ships, just slower
+                echo("%-11s%-8s%-10s%6s B   installed"
+                     % ("", "native", arch, thousands(sizes["native"])))
+        elif pick:
+            line = "%-11s%-8s%-10s%6s B" % (label, pick, arch, thousands(sizes[pick]))
+            other = "native" if pick == "viper" else None
+            if other in sizes:
+                line += "      %-8s %5s B" % (other, thousands(sizes[other]))
+            echo(line)
+        if not pick:
+            ok = False
+        label = ""
+    return entry, installed, ok
+
+
+def copy_to_board(mount, out, installed, echo=print):
+    """Put the installed .mpy files and the manifest where the shim looks."""
+    n = 0
+    for arch, path in installed:
+        d = os.path.join(mount, "lib", "turbo", arch)
+        os.makedirs(d, exist_ok=True)
+        shutil.copyfile(path, os.path.join(d, os.path.basename(path)))
+        n += 1
+    manifest = os.path.join(out, "turbo.json")
+    if n and os.path.isfile(manifest):
+        shutil.copyfile(manifest, os.path.join(mount, "lib", "turbo", "turbo.json"))
+    if n and hasattr(os, "sync"):
+        os.sync()
+    return n
+
+
 def cmd_build(a):
+    t0 = time.monotonic()
+    f = board_facts(a)
+    if a.arch == "all":
+        archs = sorted(ARCH_ID)
+    elif a.arch:
+        archs = [x.strip() for x in a.arch.split(",") if x.strip()]
+    elif f["arch"]:
+        archs = [f["arch"]]
+    else:
+        print("no board found")
+        print("   No CIRCUITPY drive and no serial port. Plug the board in, or pass")
+        print("   --mount DIR and --port TTY, or --arch NAME to build without a board.")
+        return 1
+    unknown = [x for x in archs if x not in ARCH_ID]
+    if unknown:
+        print("unknown arch %s" % ", ".join(unknown))
+        print("   Known: %s, or --arch all." % ", ".join(sorted(ARCH_ID)))
+        return 1
+    if not os.path.isdir(a.src):
+        print("no source directory %s" % a.src)
+        print("   turbo build reads .py files from src/.   turbo init")
+        return 1
+
+    mpy_cross, lines = resolve_toolchain(f["boot"].get("version"), f["abi"],
+                                         a.mpy_cross, a.offline)
+    # a cached toolchain is not worth a line; a fetch or a failure is
+    if a.verbose or not mpy_cross or any("fetching" in l for l in lines):
+        for line in lines:
+            print(line)
+    if not mpy_cross:
+        return 1
+
     manifest = load_manifest(a.out)
-    rc = 0
+    built = failed = skipped = 0
+    installed = []
     for fn in sorted(os.listdir(a.src)):
         if not fn.endswith(".py"):
             continue
         name = fn[:-3]
         path = os.path.join(a.src, fn)
-        text = open(path).read()
+        with open(path) as fh:
+            text = fh.read()
         if rewrite(text, "native") is None:
-            print("%-14s no @turbo, skipped" % name)
+            print("%-11s%-8s%s" % (name, "skipped", "no @turbo decorator"))
+            skipped += 1
             continue
         entry = manifest.setdefault(name, {})
         entry["src"] = os.path.relpath(path)
-        # The hash is written only after every arch has a fresh candidate (below);
-        # a failed build must leave `check` reporting STALE, not "fresh".
+        # The hash is written only when every arch built, so a failure leaves
+        # `check` reporting STALE rather than "fresh".
         new_sha = sha256(path)
-        all_built = True
-        for arch in a.arch.split(","):
-            d = os.path.join(a.out, arch)
-            os.makedirs(d, exist_ok=True)
-            built = {}
-            for tier in ("viper", "native"):
-                dest = os.path.join(d, "%s.%s.mpy" % (name, tier))
-                err = compile_variant(a.mpy_cross, rewrite(text, tier), name, arch, dest)
-                if err:
-                    built[tier] = "failed: " + err
-                    if os.path.exists(dest):
-                        os.remove(dest)
-                else:
-                    built[tier] = os.path.getsize(dest)
-            # install a default until bench picks: viper if it compiled, else native
-            pick = "viper" if isinstance(built.get("viper"), int) else \
-                   "native" if isinstance(built.get("native"), int) else None
-            arch_entry = entry.setdefault(arch, {})
-            arch_entry["candidates"] = built
-            # Whatever happens, the previous binary's measurements describe a
-            # binary that no longer exists.
-            arch_entry["measured"] = False
-            arch_entry.pop("bench", None)
-            arch_entry.pop("speedup_vs_bytecode", None)
-            installed_path = os.path.join(d, name + ".mpy")
-            if pick:
-                shutil.copyfile(os.path.join(d, "%s.%s.mpy" % (name, pick)), installed_path)
-                arch_entry["installed"] = pick
-            else:
-                # Do not leave an old binary standing in for the new source.
-                if os.path.exists(installed_path):
-                    os.remove(installed_path)
-                arch_entry["installed"] = None
-                all_built = False
-                rc = 1
-            print("%-14s %-10s %s -> installed %s" % (name, arch, built, pick))
-        if all_built:
+        arch_entries, module_installed, ok = build_module(mpy_cross, name, path, text,
+                                                          archs, a.out)
+        entry.update(arch_entries)
+        installed += module_installed
+        if ok:
             entry["sha256"] = new_sha
+            built += 1
+        else:
+            entry.pop("sha256", None)
+            failed += 1
     save_manifest(a.out, manifest)
-    return rc
+
+    copied = 0
+    if installed and f["mount"] and not a.no_copy:
+        copied = copy_to_board(f["mount"], a.out, installed)
+    ms = int((time.monotonic() - t0) * 1000)
+    parts = ["%d built" % built]
+    if failed:
+        parts.append("%d failed" % failed)
+    if skipped:
+        parts.append("%d skipped" % skipped)
+    parts.append("%d ms" % ms)
+    if copied:
+        parts.append("copied %d to %s" % (copied, f["mount"]))
+    elif installed and not a.no_copy and not f["mount"]:
+        parts.append("no CIRCUITPY drive, nothing copied")
+    print(", ".join(parts))
+    return 1 if failed else 0
 
 
 def board_exec(pyb, code, timeout=600):
@@ -878,6 +1013,74 @@ def validate_mpy_cross(path, version, abi=None):
     return None
 
 
+def resolve_toolchain(version, abi=None, mpy_cross=None, offline=False):
+    """(path, lines): the mpy-cross to compile with, and what to say about it. The
+    path is None when no usable binary exists, and the lines then hold the sentence
+    and the fix (SPEC 6, 8). doctor and build both go through here."""
+    lines = []
+
+    def row(label, value):
+        lines.append("%-*s%s" % (L, label, value))
+
+    if mpy_cross:
+        # an explicit path is trusted; --version is only reported, never enforced
+        _, got_abi = mpy_cross_abi(mpy_cross)
+        row("toolchain", "%s   %s" % (mpy_cross,
+                                      "mpy v%s" % got_abi if got_abi else "--version unreadable"))
+        return mpy_cross, lines
+
+    key = platform_key()
+    if key is None:
+        lines += ["host %s %s   Adafruit builds macOS arm64 only"
+                  % (platform.system(), platform.machine()),
+                  "   Rosetta (arch -arm64 is not available on Intel), or a local build:",
+                  "   make -C mpy-cross in a CircuitPython checkout, then --mpy-cross PATH."]
+        return None, lines
+    if not version:
+        row("toolchain", "no firmware version; cannot pick an mpy-cross")
+        lines.append("   Adafruit publishes one mpy-cross per CircuitPython release, so the")
+        lines.append("   board has to say which. Attach it, or pass --mpy-cross PATH.")
+        return None, lines
+    if not is_release_version(version):
+        lines += ["firmware %s   no published mpy-cross for that version" % version,
+                  "   Adafruit publishes mpy-cross per release only. Use a release build,",
+                  "   or point turbo at a local mpy-cross with --mpy-cross PATH."]
+        return None, lines
+
+    cached, fetched = cached_mpy_cross(version, key), False
+    if not cached and offline:
+        row("toolchain", "not cached  %s  %s" % (key, version))
+        lines.append(" " * L + mpy_cross_url(version, key))
+        lines.append(" " * L + "--offline, so nothing was fetched; or pass --mpy-cross PATH")
+        return None, lines
+    if not cached:
+        others = [v for v in cached_versions(key) if v != version]
+        if others:
+            # SPEC 6: a cached mpy-cross for another release is the wrong format
+            lines.append("mpy-cross %s cached, board runs %s" % (others[-1], version))
+            lines.append("   Different .mpy format. Fetching %s." % version)
+        row("toolchain", "fetching mpy-cross  %s  %s" % (key, version))
+        lines.append(" " * L + mpy_cross_url(version, key))
+        try:
+            cached = fetch_mpy_cross(version, key)
+            fetched = True
+        except ToolchainError as e:
+            lines += e.lines
+            return None, lines
+
+    bad = validate_mpy_cross(cached, version, abi)
+    if bad:
+        return None, lines + bad
+    if fetched:
+        lines.append(" " * L + "cached  %s   %d KB"
+                     % (tilde(cached), os.path.getsize(cached) // 1000))
+    else:
+        row("toolchain", "%s   %d KB   mpy v%s"  # KB = 1000, as in SPEC 5.1
+            % (tilde(cached), os.path.getsize(cached) // 1000, mpy_cross_abi(cached)[1] or "?"))
+    return cached, lines
+
+
+
 def project_state(out, arch, src="src"):
     """(module count, stale count) for `arch` in the manifest, or None with no project."""
     if not os.path.isdir(src) or not arch:
@@ -981,56 +1184,9 @@ def doctor_lines(f, mpy_cross=None, offline=False, out="lib/turbo", src="src", e
             "   Pass --arch NAME (%s)." % ", ".join(sorted(ARCH_ID)))
         return lines, False
 
-    key = platform_key()
-    if mpy_cross:
-        # an explicit path is trusted; --version is only reported, never enforced
-        got_version, abi = mpy_cross_abi(mpy_cross)
-        row("toolchain", "%s   %s" % (mpy_cross,
-                                      "mpy v%s" % abi if abi else "--version unreadable"))
-        ready = True
-    elif key is None:
-        add("host %s %s   Adafruit builds macOS arm64 only"
-            % (platform.system(), platform.machine()),
-            "   Rosetta (arch -arm64 is not available on Intel), or a local build:",
-            "   make -C mpy-cross in a CircuitPython checkout, then --mpy-cross PATH.")
-    elif not version:
-        row("toolchain", "no firmware version; cannot pick an mpy-cross")
-    elif not is_release_version(version):
-        add("firmware %s   no published mpy-cross for that version" % version,
-            "   Adafruit publishes mpy-cross per release only. Use a release build,",
-            "   or point turbo at a local mpy-cross with --mpy-cross PATH.")
-    else:
-        cached, fetched = cached_mpy_cross(version, key), False
-        if not cached and offline:
-            row("toolchain", "not cached  %s  %s" % (key, version))
-            add(" " * L + mpy_cross_url(version, key),
-                " " * L + "--offline, so nothing was fetched; or pass --mpy-cross PATH")
-        elif not cached:
-            others = [v for v in cached_versions(key) if v != version]
-            if others:
-                # SPEC 6: a cached mpy-cross for another release is the wrong format
-                add("mpy-cross %s cached, board runs %s" % (others[-1], version),
-                    "   Different .mpy format. Fetching %s." % version)
-            row("toolchain", "fetching mpy-cross  %s  %s" % (key, version))
-            add(" " * L + mpy_cross_url(version, key))
-            try:
-                cached = fetch_mpy_cross(version, key)
-                fetched = True
-            except ToolchainError as e:
-                add(*e.lines)
-        if cached:
-            bad = validate_mpy_cross(cached, version, f["abi"])
-            if bad:
-                add(*bad)
-            elif fetched:
-                add(" " * L + "cached  %s   %d KB"
-                    % (tilde(cached), os.path.getsize(cached) // 1000))
-                ready = True
-            else:
-                row("toolchain", "%s   %d KB   mpy v%s"  # KB = 1000, as in SPEC 5.1
-                    % (tilde(cached), os.path.getsize(cached) // 1000,
-                       mpy_cross_abi(cached)[1] or "?"))
-                ready = True
+    path, toolchain = resolve_toolchain(version, f["abi"], mpy_cross, offline)
+    add(*toolchain)
+    ready = path is not None
 
     p = project_state(out, f["arch"], src)
     if p:
@@ -1158,11 +1314,18 @@ def main():
     i.add_argument("--example", action="store_true",
                    help="also write the mandelbrot src/pixels.py and code.py")
     i.set_defaults(fn=cmd_init, mpy_cross=None, offline=True, json=False, verbose=False)
-    b = sub.add_parser("build")
-    b.add_argument("src")
+    b = sub.add_parser("build", help="compile the @turbo modules in SRC for this board")
+    b.add_argument("src", nargs="?", default="src")
     b.add_argument("--out", default="lib/turbo")
-    b.add_argument("--mpy-cross", default="mpy-cross")
-    b.add_argument("--arch", default=",".join(ARCHES))
+    b.add_argument("--mpy-cross", help="use this mpy-cross instead of the cached one")
+    b.add_argument("--arch", help="comma separated, or 'all'; default is the board's arch")
+    b.add_argument("--port")
+    b.add_argument("--mount")
+    b.add_argument("--board")
+    b.add_argument("--no-copy", action="store_true",
+                   help="do not copy the result to the CIRCUITPY drive")
+    b.add_argument("--offline", action="store_true", help="never fetch mpy-cross")
+    b.add_argument("-v", "--verbose", action="store_true")
     b.set_defaults(fn=cmd_build)
     n = sub.add_parser("bench")
     n.add_argument("module")
