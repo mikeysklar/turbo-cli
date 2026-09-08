@@ -83,6 +83,15 @@ Compatibility rule: the `.mpy` format is `v6.3` for all of CircuitPython 10.x.
 Use the exact board version for the download; if that URL 404s, the failure
 sentence applies. Do not silently substitute another version.
 
+Amended 2026-09-08 after the farm pass. Every turbo firmware is a build after a
+release tag, so every board reports `10.3.0-48-g799278aeb8` and the exact-version
+rule made the fetch unreachable on the boards turbo exists for. A version of the
+form `N.N.N-<count>-g<hash>[-dirty]` now falls back to its base tag, which is
+published, and says so on its own line before the toolchain row. Nothing is
+silent, and the binary's `mpy v<version>.<sub>` is still checked against the
+board's own `_mpy` before anything is compiled. A prerelease (`10.4.0-beta.1`)
+still gets the failure sentence: it sits before its tag, which may not exist.
+
 ### 2.2 Arch names and `-march` values
 
 | `_mpy >> 10` | `-march` | Boards |

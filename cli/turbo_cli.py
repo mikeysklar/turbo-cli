@@ -938,9 +938,20 @@ def cache_root():
 
 
 def is_release_version(version):
-    """Adafruit publishes mpy-cross per release only, so a version string that is not
-    exactly N.N.N (beta, rc, or a -N-ghash[-dirty] dev build) has no binary to fetch."""
+    """True for exactly N.N.N, the only shape Adafruit publishes an mpy-cross for."""
     return bool(version and re.match(r"^\d+\.\d+\.\d+$", version))
+
+
+def base_release_version(version):
+    """The release a dev build sits after, from git describe: 10.3.0-48-g799278aeb8
+    and 10.3.0-1-gaf32cbcb36-dirty both give 10.3.0. That tag is published, and every
+    turbo firmware is such a build, so without this the fetch is unreachable in
+    practice. A prerelease (10.4.0-beta.1) gives None: it sits BEFORE its tag, which
+    may not exist yet, so there is nothing to fall back to."""
+    if not version:
+        return None
+    m = re.match(r"^(\d+\.\d+\.\d+)-\d+-g[0-9a-f]{7,}(-dirty)?$", version)
+    return m.group(1) if m else None
 
 
 def cached_mpy_cross(version, key):
@@ -1070,34 +1081,41 @@ def resolve_toolchain(version, abi=None, mpy_cross=None, offline=False):
         lines.append("   Adafruit publishes one mpy-cross per CircuitPython release, so the")
         lines.append("   board has to say which. Attach it, or pass --mpy-cross PATH.")
         return None, lines
+    want = version
     if not is_release_version(version):
-        lines += ["firmware %s   no published mpy-cross for that version" % version,
-                  "   Adafruit publishes mpy-cross per release only. Use a release build,",
-                  "   or point turbo at a local mpy-cross with --mpy-cross PATH."]
-        return None, lines
+        want = base_release_version(version)
+        if not want:
+            lines += ["firmware %s   no published mpy-cross for that version" % version,
+                      "   Adafruit publishes mpy-cross per release only. Use a release build,",
+                      "   or point turbo at a local mpy-cross with --mpy-cross PATH."]
+            return None, lines
+        # Said out loud, never silent (SPEC 2.1). The .mpy format is v6.3 across all
+        # of CircuitPython 10.x, and the board's own _mpy is checked below.
+        lines.append(" " * L + "dev build of %s; using the %s mpy-cross, abi checked below"
+                     % (want, want))
 
-    cached, fetched = cached_mpy_cross(version, key), False
+    cached, fetched = cached_mpy_cross(want, key), False
     if not cached and offline:
-        row("toolchain", "not cached  %s  %s" % (key, version))
-        lines.append(" " * L + mpy_cross_url(version, key))
+        row("toolchain", "not cached  %s  %s" % (key, want))
+        lines.append(" " * L + mpy_cross_url(want, key))
         lines.append(" " * L + "--offline, so nothing was fetched; or pass --mpy-cross PATH")
         return None, lines
     if not cached:
-        others = [v for v in cached_versions(key) if v != version]
+        others = [v for v in cached_versions(key) if v != want]
         if others:
             # SPEC 6: a cached mpy-cross for another release is the wrong format
             lines.append("mpy-cross %s cached, board runs %s" % (others[-1], version))
-            lines.append("   Different .mpy format. Fetching %s." % version)
-        row("toolchain", "fetching mpy-cross  %s  %s" % (key, version))
-        lines.append(" " * L + mpy_cross_url(version, key))
+            lines.append("   Different .mpy format. Fetching %s." % want)
+        row("toolchain", "fetching mpy-cross  %s  %s" % (key, want))
+        lines.append(" " * L + mpy_cross_url(want, key))
         try:
-            cached = fetch_mpy_cross(version, key)
+            cached = fetch_mpy_cross(want, key)
             fetched = True
         except ToolchainError as e:
             lines += e.lines
             return None, lines
 
-    bad = validate_mpy_cross(cached, version, abi)
+    bad = validate_mpy_cross(cached, want, abi)
     if bad:
         return None, lines + bad
     if fetched:

@@ -68,15 +68,43 @@ def test_mount_only_guesses_the_arch_from_the_board_id(tmp_path):
             "(loader presence unknown)") in lines
 
 
-def test_dev_build_has_no_published_mpy_cross(tmp_path, monkeypatch):
+def test_a_prerelease_has_no_published_mpy_cross(tmp_path, monkeypatch):
     monkeypatch.setattr(t, "platform_key", lambda *a: "macos-arm64")
     f = facts()
-    f["boot"]["version"] = "10.3.0-5-ga80fa21afb-dirty"
-    lines, ready = t.doctor_lines(f, src=str(tmp_path / "none"))
+    f["boot"]["version"] = "10.4.0-beta.1"
+    lines, ready = t.doctor_lines(f, offline=True, src=str(tmp_path / "none"))
     assert not ready
-    assert any(l.startswith("firmware 10.3.0-5-ga80fa21afb-dirty   no published mpy-cross")
-               for l in lines)
+    assert any(l.startswith("firmware 10.4.0-beta.1   no published mpy-cross") for l in lines)
     assert not any("s3.amazonaws.com" in l for l in lines)  # never a URL that 404s
+
+
+def test_a_dev_build_falls_back_to_its_base_release(tmp_path, monkeypatch):
+    """Every turbo firmware is a build after a release tag, so without this the
+    fetch never applies to the boards turbo exists for."""
+    monkeypatch.setenv("TURBO_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setattr(t, "platform_key", lambda *a: "macos-arm64")
+    f = facts()
+    f["boot"]["version"] = "10.3.0-48-g799278aeb8"
+    lines, ready = t.doctor_lines(f, offline=True, src=str(tmp_path / "none"))
+    assert not ready  # offline, nothing cached
+    assert ("            dev build of 10.3.0; using the 10.3.0 mpy-cross, "
+            "abi checked below") in lines
+    assert "toolchain   not cached  macos-arm64  10.3.0" in lines
+    assert any(l.strip() == t.mpy_cross_url("10.3.0", "macos-arm64") for l in lines)
+
+
+@pytest.mark.parametrize("version, base", [
+    ("10.3.0-48-g799278aeb8", "10.3.0"),
+    ("10.3.0-1-gaf32cbcb36-dirty", "10.3.0"),
+    ("9.2.8-12-gabcdef1", "9.2.8"),
+    ("10.3.0", None),          # already a release, no fallback needed
+    ("10.4.0-beta.1", None),   # sits before its tag, which may not exist
+    ("10.4.0-rc.2", None),
+    ("", None),
+    (None, None),
+])
+def test_base_release_version(version, base):
+    assert t.base_release_version(version) == base
 
 
 def test_offline_prints_the_fetch_url_and_does_not_fetch(tmp_path, monkeypatch):
