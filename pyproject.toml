@@ -16,4 +16,4 @@ turbo = "turbo_cli:main"
 
 [tool.setuptools]
 package-dir = { "" = "cli" }
-py-modules = ["turbo_cli"]
+py-modules = ["turbo_cli", "turbo_repl"]
