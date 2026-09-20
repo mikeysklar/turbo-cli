@@ -193,6 +193,211 @@ def rewrite(src_text, tier):
     return "".join(out) if n else None
 
 
+# ---------------------------------------------------------------- cpython target
+# CPython has no native emitter, so on a Raspberry Pi the compiler is Cython in
+# pure Python mode. Viper's type hints map one to one, the body is not touched.
+
+CY_TYPES = {"ptr8": "cython.uchar[:]", "ptr16": "cython.ushort[:]",
+            "ptr32": "cython.uint[:]", "int": "cython.int", "uint": "cython.uint"}
+CY_FLAGS = ("boundscheck(False)", "wraparound(False)", "cdivision(True)")
+CY_INT_CALLS = {"int", "uint", "len"}
+CY_WIDTH = 99
+TURBO_IMPORT = re.compile(r"^(\s*)(from turbo import turbo|import turbo)\s*$")
+
+
+def _own_nodes(fn):
+    """Every node in fn's own scope: nested functions, lambdas and comprehensions
+    bind their own names, so they are not entered."""
+    skip = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ListComp,
+            ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    todo = [n for n in fn.body if not isinstance(n, skip)]
+    while todo:
+        node = todo.pop(0)
+        yield node
+        todo[:0] = [c for c in ast.iter_child_nodes(node) if not isinstance(c, skip)]
+
+
+def _local_values(fn):
+    """{name: [value, ...]} in first-assignment order. A value is an expression
+    node, "range" for a for-loop over range(), or None for anything else."""
+    values = {}
+    for node in _own_nodes(fn):
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                values.setdefault(name, []).append(None)
+            continue
+        if isinstance(node, ast.Assign):
+            targets, value = node.targets, node.value
+        elif isinstance(node, (ast.AugAssign, ast.AnnAssign, ast.NamedExpr)):
+            targets, value = [node.target], node.value
+            if isinstance(node, ast.AugAssign):
+                value = ast.BinOp(node.target, node.op, node.value)
+        elif isinstance(node, ast.For):
+            targets, value = [node.target], None
+            it = node.iter
+            if isinstance(it, ast.Call) and _dotted(it.func) == "range" and not it.keywords:
+                value = ast.Tuple(it.args, ast.Load())
+        elif isinstance(node, (ast.With, ast.ExceptHandler, ast.Import, ast.ImportFrom)):
+            bound = [i.optional_vars for i in getattr(node, "items", [])]
+            bound += [ast.Name(a.asname or a.name.split(".")[0])
+                      for a in getattr(node, "names", [])]
+            if getattr(node, "name", None):
+                bound.append(ast.Name(node.name))
+            targets, value = [b for b in bound if b is not None], None
+        else:
+            continue
+        for target in targets:
+            if isinstance(target, ast.Name):
+                values.setdefault(target.id, []).append(value)
+            todo = [target]
+            while todo:  # a, b = ... binds names this cannot follow; out[i] = ... binds none
+                t = todo.pop(0)
+                if isinstance(t, (ast.Tuple, ast.List)):
+                    todo[:0] = t.elts
+                elif isinstance(t, ast.Starred):
+                    todo.append(t.value)
+                elif isinstance(t, ast.Name) and t is not target:
+                    values.setdefault(t.id, []).append(None)
+    return values
+
+
+def _is_int(node, ints, ptrs):
+    """True when the expression can only be an integer, given the int names."""
+    if node is None:
+        return False
+    if isinstance(node, ast.Constant):
+        return type(node.value) is int
+    if isinstance(node, ast.Name):
+        return node.id in ints
+    if isinstance(node, ast.Tuple):  # the arguments of range()
+        return all(_is_int(e, ints, ptrs) for e in node.elts)
+    if isinstance(node, ast.BinOp):
+        if isinstance(node.op, (ast.Div, ast.Pow, ast.MatMult)):
+            return False
+        return _is_int(node.left, ints, ptrs) and _is_int(node.right, ints, ptrs)
+    if isinstance(node, ast.UnaryOp):
+        return not isinstance(node.op, ast.Not) and _is_int(node.operand, ints, ptrs)
+    if isinstance(node, ast.IfExp):
+        return _is_int(node.body, ints, ptrs) and _is_int(node.orelse, ints, ptrs)
+    if isinstance(node, ast.Subscript):
+        return isinstance(node.value, ast.Name) and node.value.id in ptrs
+    if isinstance(node, ast.Call):
+        return _dotted(node.func) in CY_INT_CALLS
+    return False
+
+
+def _int_locals(fn):
+    """(typed, untyped) local names. Starts from every local being an int and
+    drops a name while any value assigned to it is not provably one."""
+    args = fn.args.posonlyargs + fn.args.args + fn.args.kwonlyargs
+    hint = {a.arg: _dotted(a.annotation) for a in args}
+    for extra in (fn.args.vararg, fn.args.kwarg):
+        if extra:
+            hint[extra.arg] = ""
+    ptrs = {n for n, h in hint.items() if h in ("ptr8", "ptr16", "ptr32")}
+    int_args = {n for n, h in hint.items() if h in ("int", "uint")}
+    values = {n: v for n, v in _local_values(fn).items() if n not in hint}
+    typed = list(values)
+    while True:
+        ints = int_args | set(typed)
+        keep = [n for n in typed if all(_is_int(v, ints, ptrs) for v in values[n])]
+        if keep == typed:
+            return typed, [n for n in values if n not in typed]
+        typed = keep
+
+
+def _cy_wrap(indent, head, items, tail):
+    """`head(item, item)tail`, broken after commas to fit CY_WIDTH."""
+    pad = indent + " " * len(head)
+    lines, line = [], indent + head
+    for n, item in enumerate(items):
+        item += tail if n == len(items) - 1 else ","
+        if line.strip() and len(line) + len(item) + 1 > CY_WIDTH and line != indent + head:
+            lines.append(line.rstrip())
+            line = pad
+        line += item if line.endswith("(") or line == pad else " " + item
+    if not items:
+        line += tail
+    return "".join(l + "\n" for l in lines + [line])
+
+
+def _cy_header(fn, indent):
+    args = copy.deepcopy(fn.args)
+    for a in args.posonlyargs + args.args + args.kwonlyargs:
+        cy = CY_TYPES.get(_dotted(a.annotation))
+        if cy:
+            a.annotation = ast.parse(cy, mode="eval").body
+    items = [s.strip() for s in _split_args(ast.unparse(args))]
+    tail = ")" + (" -> " + ast.unparse(fn.returns) if fn.returns else "") + ":"
+    return _cy_wrap(indent, "def %s(" % fn.name, items, tail)
+
+
+def _split_args(text):
+    """Split an unparsed argument list on top-level commas."""
+    out, depth, start = [], 0, 0
+    for n, ch in enumerate(text):
+        depth += ch in "([{"
+        depth -= ch in ")]}"
+        if ch == "," and depth == 0:
+            out.append(text[start:n])
+            start = n + 1
+    return out + [text[start:]] if text.strip() else []
+
+
+def rewrite_cython(src_text):
+    """Return (source, report) with every @turbo function rewritten for Cython's
+    pure Python mode, or (None, {}) if the module has no @turbo decorators.
+
+    @turbo.viper: the three checks off, ptr8/ptr16/ptr32/int/uint hints mapped
+    through CY_TYPES, and an @cython.locals line for every local that can only
+    hold an integer. @turbo and @turbo.native carry no types: the decorator is
+    dropped and the function compiles as it stands. Bodies are copied as text.
+    report[function] = {"typed": [...], "untyped": [...], "casts": [...]}; an
+    untyped local still gives the right answer, slowly. A ptr8()/ptr16()/ptr32()
+    cast has no Cython spelling yet, so it is listed for build to refuse.
+    """
+    tree = ast.parse(src_text)
+    lines = src_text.splitlines(keepends=True)
+    fns = [n for n in ast.walk(tree)
+           if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and _deco_tier(n)]
+    if not fns:
+        return None, {}
+    report = {}
+    for fn in sorted(fns, key=lambda f: -f.lineno):  # bottom up: line numbers hold
+        deco = next(d for d in fn.decorator_list
+                    if (_dotted(d.func if isinstance(d, ast.Call) else d) or "")
+                    .split(".")[0] == "turbo")
+        indent = lines[fn.lineno - 1][:fn.col_offset]
+        new = []
+        if _deco_tier(fn) == "turbo.viper":
+            typed, untyped = _int_locals(fn)
+            casts = _uniq(_dotted(n.func) for n in _own_nodes(fn)
+                          if isinstance(n, ast.Call) and _dotted(n.func) in
+                          ("ptr8", "ptr16", "ptr32"))
+            report[fn.name] = {"typed": typed, "untyped": untyped, "casts": casts}
+            new = ["%s@cython.%s\n" % (indent, flag) for flag in CY_FLAGS]
+            if typed:
+                new.append(_cy_wrap(indent, "@cython.locals(",
+                                    ["%s=cython.int" % n for n in typed], ")"))
+            end = fn.body[0].lineno - 1  # header: from `def` to the line ending in `:`
+            depth, last = 0, None
+            for n in range(fn.lineno - 1, end):
+                code = lines[n].split("#")[0]
+                depth += sum(code.count(c) for c in "([{") - sum(code.count(c) for c in ")]}")
+                if depth == 0 and code.rstrip().endswith(":"):
+                    last = n
+                    break
+            if last is not None:  # `def f(): body` on one line keeps its hints
+                lines[fn.lineno - 1:last + 1] = [_cy_header(fn, indent)]
+        lines[deco.lineno - 1:deco.end_lineno] = new
+    for n, line in enumerate(lines):
+        m = TURBO_IMPORT.match(line)
+        if m:
+            lines[n] = m.group(1) + "import cython\n"
+            break
+    return "".join(lines), report
+
+
 def compile_variant(mpy_cross, text, name, arch, dest):
     """Compile one rewritten module. mpy-cross embeds the source path exactly as it
     is given on the command line, so it is run from inside the temp directory with a
