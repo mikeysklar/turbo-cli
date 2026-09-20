@@ -12,7 +12,8 @@ this whole file before changing code.
   `adafruit/` and nothing is announced. Turbo is unreleased.
 - **No CircuitPython checkout, no toolchain build.** The compiler is the
   official `mpy-cross` binary Adafruit publishes per release (section 2.1),
-  downloaded and cached. `--mpy-cross PATH` overrides it.
+  downloaded and cached. `--mpy-cross PATH` overrides it. The one exception is
+  `build --target cpython` (4.5, 5.3), where the compiler is Cython.
 - **No LLM anywhere.** The tool is deterministic.
 - **Never touch `code.py`.** It is never compiled; it runs from source (2.6).
   The CLI reads `src/` and writes `lib/turbo.py`, `lib/turbo/...` and `src/`
@@ -23,7 +24,9 @@ this whole file before changing code.
 - **Output formats in section 5 are the spec.** Column widths, wording and
   order match.
 - **Dependencies:** Python >= 3.9 and `pyserial`. Nothing else at runtime. No
-  `click`, no `rich`, no `watchdog`; `watch` polls.
+  `click`, no `rich`, no `watchdog`; `watch` polls. Cython is not a dependency:
+  only `build --target cpython` needs it, and says so in a sentence when it is
+  missing (section 6).
 - Style: argparse, `%`-formatting, functions named `cmd_<verb>`, no classes
   unless there is state to hold, 99-char lines.
 
@@ -260,6 +263,56 @@ A module may define `_turbo_bench()` returning a comparable value. `bench`
 times it per variant and rejects any variant whose value differs from the
 bytecode run. `verify` reuses the same contract on the host (section 5.5).
 
+### 4.5 The cpython target (`rewrite_cython`, `compile_cython`)
+
+CPython cannot load a `.mpy` and has no native emitter, so for Blinka on a
+Raspberry Pi the compiler is Cython in pure Python mode. The source file is the
+same one the boards use.
+
+`rewrite_cython(src_text)` returns `(source, report)`, or `(None, {})` when the
+module has no `@turbo` decorators. It reads the module with `ast` and edits the
+text by line number, so bodies, comments and spacing are copied untouched. Line
+numbers are **not** preserved: one decorator line becomes four or more.
+
+| Source | Becomes |
+|---|---|
+| `@turbo.viper` | `@cython.boundscheck(False)`, `@cython.wraparound(False)`, `@cython.cdivision(True)`, then `@cython.locals(...)` |
+| `ptr8`, `ptr16`, `ptr32` hints | `cython.uchar[:]`, `cython.ushort[:]`, `cython.uint[:]` |
+| `int`, `uint` hints | `cython.int`, `cython.uint`: 32 bits, wraps like viper |
+| `@turbo`, `@turbo.native` | decorator dropped, the function compiles untyped |
+| `from turbo import turbo` | `import cython` |
+
+Viper infers its int locals; Cython must be told, and an untyped local is
+silently a Python object. On the mandelbrot, untyped Cython is 1.4x and typed
+is 119x. So `@cython.locals` lists every local that can only hold an integer.
+The rule starts from every local being an int and drops a name while any value
+assigned to it is not provably one; dropping one can drop the names that read
+it, so it repeats until nothing changes. A value is an integer when it is an
+int constant, an `int`/`uint` argument, another int local, `+ - * // % << >> &
+| ^` or a unary `- + ~` on those, a conditional between two of them, a read
+from a `ptr` argument, a call to `int()`, `uint()` or `len()`, or the target of
+`for ... in range(...)` with int arguments. `/`, `**`, comparisons, floats,
+attribute reads, tuple unpacking, `for` over anything but `range`, `global` and
+`nonlocal` names are never typed. Nested functions, lambdas and comprehensions
+bind their own names and are not entered. `out[i] = x` does not rebind `i`.
+
+`report[function]` is `{"typed": [...], "untyped": [...], "casts": [...]}`.
+An untyped local still gives the right answer, slowly. `casts` lists
+`ptr8()`/`ptr16()`/`ptr32()` calls: there is no Cython spelling for them yet,
+so `build` refuses the module.
+
+`compile_cython(cythonize, text, name, dest_dir)` writes the text to a temp
+`<name>.py`, because Cython bakes the module name into the init symbol, runs
+`cythonize -i -3` there, and copies the `.so` to `dest_dir`. Any older
+`<name>.*.so` in `dest_dir` is removed first: one built for another Python
+version would never load. `cythonize` comes from `PATH`, or from beside the
+running Python for a venv that is not active.
+
+Measured 2026-09-20 on a Raspberry Pi 5, Pi OS 64-bit, Python 3.13.5, Cython
+3.3.0, the bundled mandelbrot: 141.6 ms from source, 1.2 ms built, checksum
+407644 both ways, 8.9 s to build. The same function typed by hand gave the same
+1.2 ms. A Pi Zero 2 W takes about 75 s to build a module.
+
 ## 5. Commands, with exact output
 
 Flags shared by the board-aware commands: `--port TTY`, `--mount DIR`,
@@ -388,6 +441,37 @@ copy failed, and a successful compile must not end in a traceback.
 **On a board with no native loader**, print doctor's diagnosis, which knows the
 difference between a stock board and no board at all, and exit 1.
 
+**`--target cpython`** (default `board`) compiles with Cython for the Python
+the command runs under (4.5). It reads no board, opens no port, fetches no
+`mpy-cross` and copies nothing. The `.so` goes to `lib/turbo/cpython/` and the
+manifest gets a `cpython` entry shaped like an arch entry, plus `file`, `typed`
+and `untyped`. It does not cross-build: for a Raspberry Pi, run it on the Pi.
+
+```
+$ turbo build --target cpython
+pixels     cython  cpython   1,058,544 B      7 typed
+1 built, 8863 ms
+```
+
+Same columns as a board build, then the count of typed locals. Untyped locals
+are named, because that is the silent slow case:
+
+```
+blend      cython  cpython      71,002 B      1 typed
+           untyped: ratio, q
+           these stay Python objects; a loop that uses them stays slow
+```
+
+On failure, `FAILED` and the source path, then Cython's own message, or the C
+compiler's last line. No line number: Cython counts lines in the rewritten
+source. A `ptr8()` cast fails the module before the compiler is run. Other
+modules still build; exit 1 if any failed.
+
+```
+poke       FAILED  src/poke.py
+           ptr8() cast: no Cython form yet, pass the buffer as a typed argument
+```
+
 ### 5.4 `turbo analyze [SRC=src]`
 
 Static triage, unchanged from `docs/analyze.md`: grades each function by shape
@@ -508,6 +592,9 @@ lib/turbo/armv7emsp/   present, but this board is xtensawin
 
 src/pixels.py   newer than lib/turbo/xtensawin/pixels.viper.mpy
    Stale.   turbo build
+
+Cython is not installed
+   --target cpython compiles with cythonize.   pip install cython
 
 firmware 10.4.0-beta.1   no published mpy-cross for that version
    Adafruit publishes mpy-cross per release only. Use a release build,
@@ -659,7 +746,7 @@ is reported as arch 0 with the stock sentence. Timeout 3 s; on timeout print the
 
 ## 10. Tests and acceptance
 
-Unit, pytest, no hardware. 136 tests, passing on Python 3.12 and 3.14:
+Unit, pytest, no hardware. 162 tests, passing on Python 3.12 and 3.14:
 
 - `_mpy` decode: the five values in 2.3 round-trip to (arch name, "6.3"), and
   the CLI's table agrees with the shim's.
@@ -680,6 +767,12 @@ Unit, pytest, no hardware. 136 tests, passing on Python 3.12 and 3.14:
 - `verify`: the mandelbrot pair reports `407790 -> 407644`.
 - Copy: what lands on the board, that a second run writes nothing, and that
   `code.py` is never touched.
+- `rewrite_cython()`: the exact output for a small viper function, the bundled
+  mandelbrot's seven locals with its body unchanged, every hint, what stays
+  untyped, nested scopes, globals, methods, split headers and the 99 column wrap.
+- `build --target cpython` with `compile_cython` stubbed: the report lines, the
+  manifest, that the board and `mpy-cross` are never touched, a refused
+  `ptr8()` cast, both error shapes, and the two sentences.
 
 Integration, on the eight-board farm (see the `hil-farm` skill). All five ran
 green on 2026-09-08 from an empty toolchain cache with no `--mpy-cross`
@@ -712,6 +805,9 @@ anywhere; every board was backed up first and restored and md5-verified after.
 - circup integration, bundle publishing, a `boot_out.txt` arch line, all
   upstream.
 - Any web or wasm work; see `turbo-web.md`.
+- For the cpython target: cross-building a `.so` for another machine, `ptr`
+  casts, buffer types for a function that takes objects and no hints, mapping
+  Cython's line numbers back to the source, `bench` and `watch`, and wheels.
 
 ## 12. Files to read first
 
