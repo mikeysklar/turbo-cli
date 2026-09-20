@@ -5,6 +5,7 @@ bench the candidates on a board, install the winner, keep a manifest.
     turbo_cli.py doctor [--port TTY] [--mount DIR] [--arch A] [--mpy-cross PATH]
     turbo_cli.py init   [--arch A] [--example]
     turbo_cli.py build  SRC_DIR [--out lib/turbo] [--mpy-cross PATH] [--arch a,b]
+    turbo_cli.py build  SRC_DIR --target cpython
     turbo_cli.py bench  MODULE [--port TTY] [--mount DIR] [--trials N]
     turbo_cli.py check  SRC_DIR [--out lib/turbo]
     turbo_cli.py analyze SRC [--arch A | --board B] [--json]
@@ -599,7 +600,116 @@ def copy_to_board(mount, out, installed, sources=(), echo=print):
     return ", ".join(parts)
 
 
+def find_cythonize():
+    """cythonize from PATH, or from beside this Python for a venv that is not active."""
+    beside = os.path.join(os.path.dirname(sys.executable), "cythonize")
+    return shutil.which("cythonize") or (beside if os.path.exists(beside) else None)
+
+
+def compile_cython(cythonize, text, name, dest_dir):
+    """Build one rewritten module. Returns (path of the .so, None) or (None, output).
+    The file keeps the module's own name: Cython bakes it into the init symbol."""
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, name + ".py"), "w") as f:
+            f.write(text)
+        r = subprocess.run([cythonize, "-i", "-3", name + ".py"],
+                           capture_output=True, text=True, cwd=td)
+        made = glob.glob(os.path.join(td, name + ".*.so")) + \
+            glob.glob(os.path.join(td, name + ".*.pyd"))
+        if r.returncode or not made:
+            return None, (r.stderr.strip() or r.stdout.strip() or "cythonize failed")
+        os.makedirs(dest_dir, exist_ok=True)
+        for old in glob.glob(os.path.join(dest_dir, name + ".*.so")):
+            os.remove(old)  # one built for another Python version would never load
+        dest = os.path.join(dest_dir, os.path.basename(made[0]))
+        shutil.copyfile(made[0], dest)
+    return dest, None
+
+
+def cython_error(output):
+    """Cython's own `file.py:LINE:COL: message`, else the last line (the C compiler).
+    The line number is dropped: it counts lines in the rewritten source."""
+    lines = [l for l in output.splitlines() if l.strip()]
+    for l in lines:
+        m = re.match(r"^\S+\.py:\d+:\d+: (.*)$", l)
+        if m:
+            return m.group(1)
+    return lines[-1] if lines else "cythonize failed"
+
+
+def cmd_build_cpython(a):
+    """build --target cpython: no board, no mpy-cross. The .so is for the Python
+    and the machine this runs on, so on a Raspberry Pi it is run on the Pi."""
+    t0 = time.monotonic()
+    if not os.path.isdir(a.src):
+        print("no source directory %s" % a.src)
+        print("   turbo build reads .py files from src/.   turbo init")
+        return 1
+    cythonize = find_cythonize()
+    if not cythonize:
+        print("Cython is not installed")
+        print("   --target cpython compiles with cythonize.   pip install cython")
+        return 1
+
+    manifest = load_manifest(a.out)
+    dest_dir = os.path.join(a.out, "cpython")
+    built = failed = skipped = 0
+    for fn in sorted(os.listdir(a.src)):
+        if not fn.endswith(".py"):
+            continue
+        name = fn[:-3]
+        path = os.path.join(a.src, fn)
+        with open(path) as fh:
+            text, report = rewrite_cython(fh.read())
+        if text is None:
+            print("%-11s%-8s%s" % (name, "skipped", "no @turbo decorator"))
+            skipped += 1
+            continue
+        entry = manifest.setdefault(name, {})
+        entry["src"] = os.path.relpath(path)
+        entry.pop("sha256", None)
+        casts = _uniq(c for r in report.values() for c in r["casts"])
+        if casts:
+            so, message = None, "%s() cast: no Cython form yet, pass the buffer as a " \
+                                "typed argument" % casts[0]
+        else:
+            so, output = compile_cython(cythonize, text, name, dest_dir)
+            message = None if so else cython_error(output)
+        if not so:
+            print("%-11s%-8s%s" % (name, "FAILED", path))
+            print(" " * 11 + message)
+            entry["cpython"] = {"candidates": {"cython": "failed: " + message},
+                                "installed": None, "measured": False}
+            failed += 1
+            continue
+        typed = sum(len(r["typed"]) for r in report.values())
+        untyped = _uniq(n for r in report.values() for n in r["untyped"])
+        size = os.path.getsize(so)
+        print("%-11s%-8s%-10s%6s B      %d typed"
+              % (name, "cython", "cpython", thousands(size), typed))
+        if untyped:
+            print(" " * 11 + "untyped: %s" % ", ".join(untyped))
+            print(" " * 11 + "these stay Python objects; a loop that uses them stays slow")
+        entry["cpython"] = {"candidates": {"cython": size}, "installed": "cython",
+                            "measured": False, "file": os.path.basename(so),
+                            "typed": typed, "untyped": untyped}
+        entry["sha256"] = sha256(path)
+        built += 1
+    save_manifest(a.out, manifest)
+
+    parts = ["%d built" % built]
+    if failed:
+        parts.append("%d failed" % failed)
+    if skipped:
+        parts.append("%d skipped" % skipped)
+    parts.append("%d ms" % int((time.monotonic() - t0) * 1000))
+    print(", ".join(parts))
+    return 1 if failed else 0
+
+
 def cmd_build(a):
+    if getattr(a, "target", "board") == "cpython":
+        return cmd_build_cpython(a)
     t0 = time.monotonic()
     f = board_facts(a)
     if a.arch == "all":
@@ -2031,6 +2141,9 @@ def main():
     b = sub.add_parser("build", help="compile the @turbo modules in SRC for this board")
     b.add_argument("src", nargs="?", default="src")
     b.add_argument("--out", default="lib/turbo")
+    b.add_argument("--target", choices=["board", "cpython"], default="board",
+                   help="cpython: compile with Cython for the Python this runs on, "
+                        "e.g. Blinka on a Raspberry Pi")
     b.add_argument("--mpy-cross", help="use this mpy-cross instead of the cached one")
     b.add_argument("--arch", help="comma separated, or 'all'; default is the board's arch")
     b.add_argument("--port")
