@@ -26,7 +26,7 @@ this whole file before changing code.
 - **Dependencies:** Python >= 3.9 and `pyserial`. Nothing else at runtime. No
   `click`, no `rich`, no `watchdog`; `watch` polls. Cython is not a dependency:
   only `build --target cpython` needs it, and says so in a sentence when it is
-  missing (section 6).
+  missing (section 6). Numba is not one either: only `TURBO=numba` (3.1) uses it.
 - Style: argparse, `%`-formatting, functions named `cmd_<verb>`, no classes
   unless there is state to hold, 99-char lines.
 
@@ -202,6 +202,76 @@ same module compiled.
 User code contract: `code.py` must `import turbo` before importing any
 accelerated module. Modules opt in with `from turbo import turbo` and one of
 the three decorators.
+
+### 3.1 The same project on CPython (`cli/turbo.py`)
+
+The project folder above also runs on a Raspberry Pi under Blinka, unchanged:
+`python3 code.py`. There are two files called `turbo.py`. The board's is
+`lib/turbo.py` in the project. CPython's is `cli/turbo.py`, installed as the
+top-level module `turbo` with the CLI.
+
+It cannot live in the project. `python3 code.py` puts the project folder on
+`sys.path`, not `lib/`, so `lib/turbo.py` is never found there, and a `turbo.py`
+in the project root would shadow the board shim, because on a board the root
+comes before `/lib`. The board's `lib/turbo.py` sits unused on a Pi.
+
+```
+project/
+  code.py
+  lib/turbo/cpython/<mod>.cpython-313-aarch64-linux-gnu.so   from build --target cpython
+  src/<mod>.py                                               the fallback
+```
+
+At import it takes the project to be the folder of the script being run (the
+current folder when there is none), and inserts `lib/turbo/cpython` then `src`
+at the front of `sys.path`, each only if it exists. So a module with a built
+file loads it and any other module loads from source, the same rule as on a
+board. It exposes `turbo.arch` (`"cpython"`), `turbo.mode`, `turbo.paths` and
+`turbo.path` (`None` when neither folder exists), and the three decorators.
+
+It defines `ptr8`, `ptr16`, `ptr32`, `ptr` and `uint` as builtins. MicroPython
+never evaluates `out: ptr8`; CPython before 3.14 does when the function is
+defined, and raises NameError without them. As casts the `ptr` names hand the
+buffer straight back and `uint` masks to 32 bits, so viper source that casts
+still runs from source.
+
+The `TURBO` environment variable picks the mode. Anything else prints one line
+and is ignored.
+
+| `TURBO` | Effect |
+|---|---|
+| unset | Built file if there is one, else source. The decorators change nothing |
+| `numba` | `@turbo.viper` becomes `numba.njit(cache=True)`. No build step. `@turbo` and `@turbo.native` are left alone. A built file still wins for its module |
+| `source` | `lib/turbo/cpython` is left off the path, everything runs from source |
+
+Numba is opt-in, never automatic: on the boards nothing changes how code runs
+unless a build was run, and numba brings a start-up delay and 64-bit ints that
+do not wrap like viper's. Numba types a function on its first call, before
+running any of it, so the wrapper catches `NumbaError` there, prints
+`turbo: numba cannot compile <fn>, running it from source` and the error's
+first line, and calls the plain function from then on. `TURBO=numba` without
+numba installed prints one line per function and runs from source.
+
+Measured 2026-09-21, the bundled mandelbrot, checksum 407644 in every cell.
+Import is `import turbo` plus the module; milliseconds.
+
+| Raspberry Pi 5 | import | first frame | later frames |
+|---|---|---|---|
+| source | 7 | 158 | 141.4 |
+| `TURBO=numba`, first ever run | 879 | 318.5 | 2.0 |
+| `TURBO=numba`, cached | 256 | 171.6 | 1.9 |
+| built with `--target cpython` | 3 | 1.2 | 1.2 |
+
+| Raspberry Pi Zero 2 W | import | first frame | later frames |
+|---|---|---|---|
+| source | 44 | 1 408 | 1 376 |
+| `TURBO=numba`, first ever run | 5 130 | 4 978 | 8.8 |
+| `TURBO=numba`, cached | 1 918 to 3 062 | about 1 450 | 8.8 |
+
+The module name is fixed by `from turbo import turbo`. PyPI has an unrelated
+package called `turbo` (a tornado web framework) that installs a module of the
+same name; the two cannot be installed together. The distribution name
+`adafruit-turbo` is free.
 
 ## 4. Conventions
 
@@ -746,7 +816,7 @@ is reported as arch 0 with the stock sentence. Timeout 3 s; on timeout print the
 
 ## 10. Tests and acceptance
 
-Unit, pytest, no hardware. 162 tests, passing on Python 3.12 and 3.14:
+Unit, pytest, no hardware. 173 tests, passing on Python 3.12 and 3.14:
 
 - `_mpy` decode: the five values in 2.3 round-trip to (arch name, "6.3"), and
   the CLI's table agrees with the shim's.
@@ -773,6 +843,11 @@ Unit, pytest, no hardware. 162 tests, passing on Python 3.12 and 3.14:
 - `build --target cpython` with `compile_cython` stubbed: the report lines, the
   manifest, that the board and `mpy-cross` are never touched, a refused
   `ptr8()` cast, both error shapes, and the two sentences.
+- `cli/turbo.py`, each case a small project run in its own Python process with
+  a fake `numba` on the path: source, a built module winning, `TURBO=source`,
+  the project found from the script and not the current folder, an unknown
+  mode, numba mode with the cache on, the one-notice fallback, numba missing,
+  the casts, and a script with no project folders.
 
 Integration, on the eight-board farm (see the `hil-farm` skill). All five ran
 green on 2026-09-08 from an empty toolchain cache with no `--mpy-cross`
@@ -808,6 +883,9 @@ anywhere; every board was backed up first and restored and md5-verified after.
 - For the cpython target: cross-building a `.so` for another machine, `ptr`
   casts, buffer types for a function that takes objects and no hints, mapping
   Cython's line numbers back to the source, `bench` and `watch`, and wheels.
+- For the CPython shim: warning when `src/<mod>.py` is newer than its built file
+  (`turbo check` reports it), a `micropython` module for `const`, and numba for
+  `@turbo.native`.
 
 ## 12. Files to read first
 
